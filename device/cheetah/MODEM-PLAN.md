@@ -3512,3 +3512,78 @@ coherency on before DMA (`cp_set_iocc()` at `link_up`); write-back mappings
 of the cacheable regions; no CPU mapping of AoC voice SRAM; no `remove()`
 for cpif; panics turned into errors.
 
+## Read-only SIM number query (0.3.37, 2026-11-14)
+
+`omamobile-sit own-number [--json]` asks the existing daemon to read
+EF_MSISDN (6F40) from the ready USIM. The daemon remains the only IPC0
+owner. This is an explicit private socket action, not an automatic
+startup or status query: no number is cached in status, subscriptions,
+the database, the public state file or logs. The ModemManager bridge's
+`OwnNumbers` policy is unchanged.
+
+The separate `allow_msisdn` owner flag grants only GET RESPONSE and
+absolute READ RECORD on that file, under the USIM ADF, with no PIN2 or
+write data. Record sizes, counts and total time are bounded. The first
+version does not read extension files: an extension-dependent number
+is reported incomplete rather than silently truncated. A missing or
+unreadable file is unavailable, distinct from a successfully read file
+with empty records. A SIM-stored number is not proof of the current
+carrier-assigned number.
+
+The synchronous query can delay processing incoming indications for up to
+15 seconds. Active calls are refused; incoming-call latency during a slow
+SIM response has not been qualified. Use the command while the phone is
+idle.
+
+Gated runbook (no kernel or boot-image changes):
+
+1. **Offline, no hardware risk:** run
+   `packages/omamobile-modem-sit/test/all` and `git diff --check`, then
+   build the package. Expect the SIM parser, byte-by-byte transport
+   restrictions, authorized socket action, CLI and privacy tests to
+   pass. Stop on any failure. Rollback: discard the local feature files.
+2. **Install, low risk:** preserve the installed package and private
+   configuration. Build and upgrade to 0.3.37 through the project's
+   package tooling. Expect 0.3.37 and the existing sitd PID unchanged.
+   Stop if an unrelated dependency or service change is required. Do not
+   remove the package or restart sitd on a running CP. Rollback: install
+   the saved previous package, leaving the running daemon alone.
+3. **Activate, attended reboot:** check NV backups and charging; inspect
+   the modem's existing markers and ensure no live call. Ask the owner
+   before the reboot (AGENTS section 1). Use a clean systemd reboot so
+   the modem's stop hook clears its online marker. Expect the same
+   kernel, then modem ONLINE and sitd running. Stop on lost SSH beyond
+   three minutes, CP crash, or storage errors; do not retry the profile
+   in the same boot. Rollback: the saved package and another approved
+   clean reboot.
+4. **Query, bounded read-only:** with no live call, run
+   `omamobile-sit own-number --json` once. Expect `source: sim` and one
+   of available, empty, unavailable or incomplete. Return a number only
+   for available; do not publish the number or raw SIM data in this
+   runbook. Stop on any timeout, parser refusal, modem state change or
+   unexpected kernel error. Verify voice/SMS registration and data
+   remain as before. No SIM write or retry with arbitrary APDUs is a
+   recovery action.
+
+**Results, 2026-11-14:** kernel
+`7.3.0-rc6-omamobile-g1a9d1d4e9289`, local
+`omamobile-modem-sit` 0.3.31.1-1. The installed 0.3.31 baseline matched
+the source files before patching. Thirty-nine targeted parser, guard,
+private socket and CLI tests passed, as did the full package suite with
+the RIL simulator, the native aarch64 build and an independent source
+review. The original package was rebuilt and kept for rollback. The
+upgrade preserved the running daemon PID and the private configuration.
+
+After the owner's approved clean reboot
+(`systemctl reboot --reboot-argument=omamobile`), the same kernel booted,
+the modem came ONLINE and registration completed. One explicit query
+returned `available`, `source: sim`, with one number; the value is not
+recorded here. The number was absent from public state and the daemon
+journal. The modem, sitd, cellular-data service and ModemManager bridge
+remained active; the SIM was ready, LTE registered at home, and IMS
+voice/SMS and data remained available. No current-boot UFS error-handler
+pass, I/O error, oops, failed BME access or watchdog-stop error was found.
+The temporary runtime watchdog was restored to its previous setting.
+The query code tested in that local build is carried into 0.3.37 on the
+current main branch; that rebased package has not been installed on the
+phone. Other devices and incoming calls during a query were not tested.
