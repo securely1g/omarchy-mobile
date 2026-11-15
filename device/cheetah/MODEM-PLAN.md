@@ -4100,3 +4100,80 @@ Next work needs separately reviewed owned-bearer reconciliation, preserving
 the reservation and accounting for all other contexts before any recovery
 SETUP. No blind bearer recreation or further phone write is authorized by
 the completed two-reboot test sequence.
+
+### M6 guarded same-CID recovery candidate (0.3.37.3, not hardware-qualified)
+
+The next local candidate adds `[control] recover_data = no`, an experimental
+opt-in, independent of screen following and modem suspend. It captures the
+successful original internet SETUP privately in RAM, bound to the existing
+IPC owner and modern session 0. Ownership remains reserved when the bearer
+is absent; no file is deleted to bypass `activate()`.
+
+With the opt-in, sitd captures a fresh all-CID baseline. A `0604` change
+only schedules reconciliation. Recovery requires stable accepted packet
+registration, two fresh absent-target lists, unchanged known foreign/IMS
+contexts, no call or conflicting event, unchanged configuration and a fresh
+awake host lease. LTE and LTE-CA representation changes do not rewrite the
+original SETUP request. Unknown or newly numbered contexts refuse recovery.
+
+The host acknowledges quiescence after removing only its owned route,
+address and DNS contribution. It keeps the original interface name/ifindex;
+reload never searches other rmnet devices. Only then may sitd send one
+same-CID SETUP, with its once-per-boot budget recorded before transmission.
+There is no ALLOW_DATA, DEACTIVATE, radio, NR, attach/profile, IMS or modem
+restart in this transaction. Requests are asynchronous on the same owner;
+ordinary call/SMS/socket requests retain their own reply tokens.
+
+A validated reply and fresh confirming list precede atomic publication of
+the new configuration. The host must apply it on the pinned interface and
+pass bound ICMP and TCP checks before restoring metric 700 and acknowledging
+availability. IP/DNS changes are supported without touching other contexts.
+The private host ledger supports proven cleanup after helper failure;
+ambiguous ownership never permits rediscovery or another SETUP.
+
+An independent PID1 unit holds a strong sleep inhibitor during recovery.
+Uncertain outcomes retain it until reboot. A separate permanent failsafe
+also covers helper failure or unexpected daemon exit, including before the
+coordinator arms. It works with sitd's existing read-only `/etc` sandbox;
+hardening is unchanged. No guard path restarts the modem/SIT or writes `/etc`.
+Cached private `recovery-status` returns only fixed states/flags, and the
+private bearer diagnostic includes redacted per-CID state/presence flags.
+Neither action publishes addresses or raw replies.
+
+Offline gates include transport interleaving with real service call-accept
+and SMS-ACK handling, actual daemon/host generation round trips, changed
+IP/DNS, foreign conflicts, helper restarts, failed quiescence/proof, loss of
+guards/leases, cancellation, spent-budget uncertainty and privacy. Independent
+source review passed. The full SIT/simulator/package gates remain required
+before installation; offline success does not qualify modem-online sleep.
+
+Gated attended run, **fresh approval required**:
+
+1. **Low risk, read-only:** repeat the established NV, charging, RTC, s2idle,
+   storage, guard, live-data/IMS/SIM and smoke preflight. Verify the signed
+   package, exact source hashes and rollback. Stop on a failed prerequisite;
+   rollback is no change to the working phone.
+2. **Medium risk:** install only SIT 0.3.37.3, save the exact original private
+   config, enable the two reviewed control opt-ins and modem-suspend marker,
+   then take approved clean reboot 1. No kernel/device package or image write.
+   Require fresh awake data and coordinator availability with initial host
+   ACK 0, known inventory and pinned interface before attempting sleep.
+3. **High risk:** one attended RTC alarm for 45 seconds and normal systemd
+   suspend, with its hooks/inhibitors, the established watchdog and laptop
+   logs. Announce NFC/screen changes. After actual wake, use passive counters
+   and cached recovery state first; allow at most one explicitly approved
+   daemon-owned SETUP, not external/manual retries. Observe no longer than
+   180 seconds. Once available, independently verify fresh bearer state and
+   both bound ICMP/HTTPS; preserve actual timings and every temporary loss.
+   A lost/uncertain state or new serious error stops the test. No second sleep.
+4. **Mandatory teardown:** restore the exact original config, remove the
+   suspend marker, establish the normal modem inhibitor and restore NFC;
+   use approved clean reboot 2 on success or early failure. Verify fresh
+   data/IMS/SIM, required smoke and all six NV checksums, watchdog 0, no test
+   RTC alarm and automatic sleep off. A third reboot or package rollback
+   requires another explicit approval. If no wake within two minutes, stop
+   commands and use owner recovery. No warm restart or forced suspend.
+
+The first run can only establish a bounded recovery regression result.
+One-attempt-per-boot protection, early wakes, call/SMS wake, repeated sleep
+reliability and power consumption remain separate qualification work.

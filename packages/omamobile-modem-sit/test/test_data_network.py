@@ -24,6 +24,25 @@ class ResolverTests(unittest.TestCase):
         for data in (b'',bytes(132),b'\0\0\2\1\3'+bytes(127)):
             with self.assertRaises(ValueError): configuration(data)
 
+    def test_resolved_dns_changes_even_when_default_route_policy_does_not(self):
+        with patch.object(data_network, 'run') as run:
+            resolver = data_network.ResolvedLink(['192.0.2.53'], 'rmnet2')
+            resolver.update(False, ['192.0.2.53'])
+            resolver.update(False, ['198.51.100.53'])
+            self.assertIn(('resolvectl', 'dns', 'rmnet2', '198.51.100.53'),
+                          [c.args for c in run.call_args_list])
+            resolver.release()
+            resolver.update(False, ['198.51.100.53'])
+            self.assertEqual(run.call_args_list[-2].args,
+                             ('resolvectl', 'dns', 'rmnet2', '198.51.100.53'))
+
+    def test_resolved_release_failure_cannot_be_acknowledged(self):
+        with patch.object(data_network, 'run') as run:
+            resolver = data_network.ResolvedLink(['192.0.2.53'], 'rmnet2')
+            run.side_effect = RuntimeError('synthetic failure')
+            with self.assertRaises(RuntimeError):
+                resolver.release()
+
 class RouteTests(unittest.TestCase):
     def test_only_logind_sleep_announcements_count(self):
         line = '{"type":"signal","member":"PrepareForSleep","payload":{"type":"b","data":[%s]}}'

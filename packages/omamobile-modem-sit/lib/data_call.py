@@ -20,11 +20,13 @@ request unchanged, so on LTE and NR the modem picks the ID itself. Records
 from 0.3.4 and earlier hold an allocated ID, which deactivate() still
 releases.
 """
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
 import struct
+import tempfile
 import time
 
 from paths import RUN
@@ -43,6 +45,68 @@ IP_TYPES = {'ipv4': 1, 'ipv6': 2, 'ipv4v6': 3}
 # setup on CID 1 replaced the attach PDN (2026-11-03).
 IMS_CID = 2
 INTERNET_CID = 1
+
+
+@dataclass(frozen=True, repr=False)
+class OriginalSetup:
+    """The successful internet setup on this IPC owner; private RAM only."""
+    client: object
+    cid: int
+    payload: bytes
+    state: bytes
+    response: bytes
+
+
+_original_setup = None
+
+
+def original_setup(client):
+    """Never reuse another IPC owner's setup, including after a restart."""
+    return _original_setup if _original_setup and _original_setup.client is client else None
+
+
+def recovery_payload(client, original):
+    """The exact original request, only while its reservation is unchanged.
+
+    This does not send or publish anything. The recovery coordinator owns
+    the fresh-list barriers, sleep exclusion and spent-before-send budget.
+    """
+    if original is not original_setup(client) or original is None:
+        raise RuntimeError('original internet setup unavailable')
+    owned = json.loads(original.state)
+    if type(owned.get('cid')) is not int or owned['cid'] != original.cid \
+            or not 1 <= original.cid <= 15 or original.cid == IMS_CID \
+            or type(owned.get('session')) is not int or owned['session'] != 0 \
+            or len(original.payload) != 971 or original.payload[0] != original.cid \
+            or struct.unpack_from('<i', original.payload, 0xf6 - 12)[0] != 0:
+        raise RuntimeError('original internet setup is not recoverable')
+    state, response = paths(original.cid)
+    if state.read_bytes() != original.state or response.read_bytes() != original.response:
+        raise RuntimeError('internet setup reservation changed')
+    return original.payload
+
+
+def begin_recovery_setup(client, original):
+    """Send only the captured SETUP, through the existing async IPC owner."""
+    return client.begin_request(0x0600, recovery_payload(client, original), timeout=45)
+
+
+def publish_recovery_response(client, original, response):
+    """Publish after the coordinator's fresh proof, without releasing ownership."""
+    recovery_payload(client, original)
+    import network_lifecycle
+    if not isinstance(response, (bytes, bytearray)):
+        raise RuntimeError('invalid recovered internet response')
+    network_lifecycle.configuration(dict(version=1, epoch='0' * 32, generation=0,
+        phase='active', cid=original.cid, binding=None, response_hex=response.hex(), reason=None))
+    target = paths(original.cid)[1]
+    fd, name = tempfile.mkstemp(prefix='.data-recovery-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(response)
+        os.replace(name, target)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def paths(cid):
@@ -502,6 +566,7 @@ def listen_after_failure(client, seconds=5, on_event=None):
     print(f'after the failure: {seen} indication(s) in {seconds} s', flush=True)
 
 def activate(client, apn, *, ims=False, ip_type=None, apn_types=None, lte_access=False, on_event=None):
+    global _original_setup
     requested_cid = IMS_CID if ims else INTERNET_CID
     state_path, response_path = paths(requested_cid)
     state = client.request(0x0701)
@@ -532,15 +597,21 @@ def activate(client, apn, *, ims=False, ip_type=None, apn_types=None, lte_access
     session = 0
     # Persist ownership before setup. A timeout has an unknown outcome: the
     # record stays while the modem may still be activating the bearer.
-    private_write(state_path, json.dumps({'cid': requested_cid, 'session': session}).encode())
+    state_record = json.dumps({'cid': requested_cid, 'session': session}).encode()
+    private_write(state_path, state_record)
     released = False
     try:
         rat = 14 if lte_access else state[3]
         print('data setup access RAT', rat, 'registered RAT', state[3], 'PDU session ID', session, flush=True)
         if apn_types is not None:
             print(f'data setup APN types 0x{apn_types:x} (from the data profile)', flush=True)
-        result = client.request(0x0600, setup_payload(requested_cid, rat, session, apn, ims=ims,
-                                                      ip_type=ip_type, apn_types=apn_types), timeout=45)
+        request = setup_payload(requested_cid, rat, session, apn, ims=ims,
+                                ip_type=ip_type, apn_types=apn_types)
+        if not ims:
+            # Constructed before transmission; an unknown original outcome
+            # must not leave an earlier successful capture recoverable.
+            _original_setup = None
+        result = client.request(0x0600, request, timeout=45)
         if len(result) < 132:
             raise RuntimeError('unexpected data-call layout')
         status, cid, raw_active, pdp = struct.unpack_from('<HBBB', result)
@@ -557,6 +628,9 @@ def activate(client, apn, *, ims=False, ip_type=None, apn_types=None, lte_access
             listen_after_failure(client, on_event=on_event)
             raise RuntimeError('data call did not become active')
         private_write(response_path, result)
+        if not ims:
+            _original_setup = OriginalSetup(client, requested_cid, bytes(request),
+                                            state_record, bytes(result))
         print('owned data bearer active; private IP configuration retained in RAM', flush=True)
         if ims:
             # Base response layout: family then 3 v4 and 3 v6 P-CSCF

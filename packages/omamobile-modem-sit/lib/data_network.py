@@ -37,12 +37,14 @@ import os
 from pathlib import Path
 import select
 import signal
+import socket
 import struct
 import subprocess
 import time
 
 import cp
 import paths
+import network_lifecycle as lifecycle
 from data_call import RESPONSE
 
 RESOLVER = Path('/etc/resolv.conf')
@@ -109,6 +111,38 @@ def answers(dev):
     return False
 
 
+def transport_proof(dev, address, allowed=lambda: True):
+    """One bounded ICMP check and one TCP connect, both on the pinned link.
+
+    No DNS, HTTP response body or new tool dependency. A failed bind never
+    falls back to the default interface. Both transports must answer.
+    """
+    icmp = False
+    for target in ('1.1.1.1', '8.8.8.8'):
+        if not allowed():
+            return False
+        try:
+            result = subprocess.run(['ping', '-n', '-q', '-c', '1', '-W', '3',
+                                     '-I', dev, target], capture_output=True, timeout=5)
+            icmp = result.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            pass
+        if icmp:
+            break
+    if not icmp or not allowed():
+        return False
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as connection:
+            connection.settimeout(3)
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                                  dev.encode('ascii') + b'\0')
+            connection.bind((address, 0))
+            connection.connect(('1.1.1.1', 443))
+    except OSError:
+        return False
+    return allowed()
+
+
 class Resolver:
     """The carrier's DNS in /etc/resolv.conf while cellular is the only way
     out; the previous file comes back unless something (NetworkManager) has
@@ -143,15 +177,25 @@ class ResolvedLink:
     def __init__(self, servers, dev):
         self.dev = dev
         run('resolvectl', 'dns', dev, *servers)
+        self.servers = tuple(servers)
         self.cellular = None
 
     def update(self, cellular, servers):
+        if tuple(servers) != self.servers:
+            run('resolvectl', 'dns', self.dev, *servers)
+            self.servers = tuple(servers)
         if cellular != self.cellular:
             run('resolvectl', 'default-route', self.dev, 'yes' if cellular else 'no')
             self.cellular = cellular
 
     def restore(self):
         subprocess.run(['resolvectl', 'revert', self.dev], capture_output=True, timeout=20)
+
+    def release(self):
+        """Acknowledged cleanup for the cooperative lifecycle."""
+        run('resolvectl', 'revert', self.dev)
+        self.servers = None
+        self.cellular = None
 
 
 def resolver_for(servers, dev):
@@ -221,7 +265,7 @@ def clear_stale():
     INTERFACE.unlink(missing_ok=True)
 
 
-def find_device(address, cid, probe=None, stopped=lambda: False):
+def find_device(address, cid, probe=None, stopped=lambda: False, eligible=lambda dev: True):
     """Bring each unused candidate up with the bearer's /32 and the metric-700
     default route until one carries it (ping -I binds to the device, so the
     route through it is used even with Wi-Fi's better one present); that one
@@ -233,7 +277,7 @@ def find_device(address, cid, probe=None, stopped=lambda: False):
     for dev in candidates(cid):
         if stopped():
             break
-        if not unused(dev):
+        if not unused(dev) or not eligible(dev):
             continue
         paths.run_dir()
         INTERFACE.write_text(dev + '\n')
@@ -392,10 +436,521 @@ class SleepHold:
         self.back_at = None
 
 
+class HostFailure(RuntimeError):
+    """Only fixed lifecycle reason labels may leave the host transaction."""
+
+
+class Superseded(HostFailure):
+    pass
+
+
+class ManagedNetwork:
+    """Cooperative host configuration; never owns a modem channel.
+
+    Only start() can discover a device. All later operations are confined
+    to the saved interface index, CID, and configuration this object added.
+    An unsuccessful generation cannot enter the ordinary fallback watch.
+    """
+    def __init__(self, state, drain=lambda: None):
+        lifecycle.response_bytes(state)  # complete schema validation
+        self.state = state
+        self.binding = None
+        self.address = None
+        self.dns = []
+        self.resolver = None
+        self.available = False
+        self.quiesced = False
+        self.failed = False
+        self.uncertain = False
+        self.hold = SleepHold()
+        self.awake_at = 0
+        self.seen = None
+        self.check_at = 0
+        self.retry_at = None
+        self.retries = 0
+        self.drain = drain
+        self.owned = None
+
+    def journal(self, **changes):
+        if self.owned is None:
+            raise HostFailure('host-operation')
+        value = dict(self.owned, generation=self.state['generation'], **changes)
+        if value == self.owned:
+            return
+        self.owned = lifecycle.publish_host(value)
+
+    def claim(self, response_hex, *, address_state='none', route_state='none'):
+        value = {key: self.state[key] for key in ('version', 'epoch', 'generation', 'cid')}
+        value.update(binding=self.binding, response_hex=response_hex,
+                     address_state=address_state, route_state=route_state, dns={'kind': 'none'})
+        self.owned = lifecycle.publish_host(value)
+
+    @property
+    def dev(self):
+        return self.binding['dev']
+
+    def awake(self):
+        return not self.hold.sleeping and time.monotonic() >= self.awake_at
+
+    def lease(self, desired=True):
+        lifecycle.publish_lease(self.state, desired=desired,
+                                awake=self.awake() and not self.failed,
+                                binding=self.binding)
+
+    def current(self):
+        self.drain()
+        if lifecycle.read_state() != self.state:
+            raise Superseded('stale-generation')
+
+    def permitted(self):
+        self.current()
+        return self.awake() and not roaming_blocked()
+
+    def inspect(self):
+        """Read ownership collisions before touching the pinned device."""
+        try:
+            links = json.loads(run('ip', '-j', 'address', 'show', 'dev', self.dev))
+            if len(links) != 1 or links[0]['ifindex'] != self.binding['ifindex'] \
+                    or 'UP' not in links[0]['flags']:
+                raise HostFailure('interface-changed')
+            addresses = links[0]['addr_info']
+            if any(a.get('family') != 'inet' or a.get('local') != self.address
+                   or a.get('prefixlen') != 32 for a in addresses):
+                raise HostFailure('host-conflict')
+            routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all'))
+            defaults = [r for r in routes if r.get('dst') == 'default'
+                        and r.get('table', 'main') in ('main', 254)]
+            candidates = [r for r in defaults if r.get('dev') == self.dev and r.get('metric') == 700]
+            if len(candidates) > 1 or any(self.address is None or r.get('prefsrc') != self.address
+                                          or r.get('gateway') for r in candidates):
+                raise HostFailure('host-conflict')
+            for route in routes:
+                if route.get('dev') != self.dev or route in candidates:
+                    continue
+                # The kernel may create a connected /32 with the address.
+                # Any other route makes address ownership ambiguous, even
+                # when its default-route metric differs from ours.
+                connected = (self.address is not None
+                             and route.get('dst') in (self.address, self.address + '/32')
+                             and route.get('protocol') == 'kernel'
+                             and route.get('prefsrc') == self.address
+                             and not route.get('gateway')
+                             and route.get('metric', 0) == 0
+                             and ((route.get('scope') == 'link'
+                                   and route.get('table', 'main') in ('main', 254))
+                                  or (route.get('scope') == 'host'
+                                      and route.get('table') in ('local', 255)
+                                      and route.get('type') == 'local')))
+                if not connected:
+                    raise HostFailure('host-conflict')
+            return bool(candidates), [r for r in defaults if r not in candidates], bool(addresses)
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise HostFailure('host-conflict') from None
+
+    def mutation(self, *args):
+        try:
+            return run(*args)
+        except subprocess.TimeoutExpired:
+            # A timed-out ip/resolver command may have changed the host.
+            # Never call that quiesced or blindly claim/delete its result.
+            self.uncertain = True
+            raise HostFailure('host-operation') from None
+
+    def drop_route(self):
+        routed, _, _ = self.inspect()
+        if routed:
+            self.journal(route_state='removing')
+            self.mutation('ip', 'route', 'del', 'default', 'dev', self.dev,
+                          'src', self.address, 'metric', '700')
+        self.journal(route_state='none')
+
+    def set_dns(self, cellular):
+        if self.resolver is None:
+            target = str(RESOLVER.resolve()) if RESOLVER.exists() else ''
+            if target.startswith('/run/systemd/resolve/'):
+                self.journal(dns=dict(kind='resolved', state='setting'))
+            self.resolver = resolver_for(self.dns, self.dev)
+        if isinstance(self.resolver, Resolver):
+            if not cellular:
+                self.release_dns()
+                return
+            current = self.resolver.path.read_text()
+            original = (current if self.resolver.owned is None or current != self.resolver.owned
+                        else self.resolver.original)
+            content = '# Omarchy Mobile cellular fallback (session only)\n' + ''.join(
+                'nameserver ' + server + '\n' for server in self.dns)
+            saved = dict(kind='file', state='setting', path=str(self.resolver.path),
+                         original=original, owned=content)
+            if self.owned['dns'] != dict(saved, state='owned'):
+                self.journal(dns=saved)
+            self.resolver.update(True, self.dns)
+            self.journal(dns=dict(saved, state='owned'))
+        else:
+            if (self.owned['dns'] == dict(kind='resolved', state='owned')
+                    and getattr(self.resolver, 'servers', None) == tuple(self.dns)
+                    and getattr(self.resolver, 'cellular', None) is cellular):
+                return
+            self.journal(dns=dict(kind='resolved', state='setting'))
+            self.resolver.update(cellular, self.dns)
+            self.journal(dns=dict(kind='resolved', state='owned'))
+
+    def saved_resolver(self):
+        """Reconstruct only the cleanup handle, without installing DNS."""
+        dns = self.owned['dns']
+        if dns['kind'] == 'file':
+            if str(RESOLVER.resolve()) != dns['path']:
+                raise HostFailure('host-conflict')
+            self.resolver = Resolver(RESOLVER)
+            self.resolver.original, self.resolver.owned = dns['original'], dns['owned']
+        elif dns['kind'] == 'resolved':
+            self.resolver = ResolvedLink.__new__(ResolvedLink)
+            self.resolver.dev = self.dev
+            self.resolver.servers = tuple(self.dns)
+            self.resolver.cellular = None
+
+    def release_dns(self):
+        # The constructor may have set link DNS before raising. Its pending
+        # journal is enough for a checked revert, never for a new DNS set.
+        if self.resolver is None and self.owned['dns']['kind'] != 'none':
+            self.saved_resolver()
+        if self.resolver is not None:
+            saved = self.owned['dns']
+            if saved['kind'] != 'none':
+                self.journal(dns=dict(saved, state='releasing'))
+            try:
+                if isinstance(self.resolver, ResolvedLink):
+                    self.resolver.release()
+                else:
+                    self.resolver.restore()
+            except subprocess.TimeoutExpired:
+                self.uncertain = True
+                raise HostFailure('host-operation') from None
+            self.resolver = None
+        self.journal(dns=dict(kind='none'))
+
+    def quiesce(self):
+        self.available = False
+        self.retry_at = None
+        self.hold.cancel()
+        if self.binding is None or self.uncertain:
+            raise HostFailure('host-operation')
+        self.drop_route()
+        self.release_dns()
+        _, _, addressed = self.inspect()
+        if addressed:
+            self.journal(address_state='removing')
+            self.mutation('ip', 'addr', 'del', self.address + '/32', 'dev', self.dev)
+        self.journal(address_state='none')
+        self.address = None
+        self.dns = []
+        # Read back the cleanup; no ACK if a route/address remains or an
+        # unrelated configuration appeared during the operation.
+        routed, _, addressed = self.inspect()
+        if routed or addressed:
+            raise HostFailure('host-operation')
+        self.quiesced = True
+
+    def fail(self, reason):
+        self.failed = True
+        self.available = False
+        self.retry_at = None
+        self.hold.cancel()
+        try:
+            if self.binding is not None:
+                self.quiesce()
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            pass
+        lifecycle.publish_ack(self.state, 'failed', binding=self.binding, reason=reason)
+        self.lease()
+        print('Cellular host configuration unavailable:', reason, flush=True)
+
+    def interval(self):
+        self.seen = counters(json.loads(run('ip', '-j', '-s', 'link', 'show', 'dev', self.dev)))
+        self.check_at = time.monotonic() + HEALTH_INTERVAL
+
+    def add_route(self):
+        self.current()
+        routed, _, addressed = self.inspect()
+        if not addressed or not self.permitted():
+            raise HostFailure('canceled')
+        if not routed:
+            self.journal(route_state='adding')
+            self.mutation('ip', 'route', 'add', 'default', 'dev', self.dev,
+                          'src', self.address, 'metric', '700')
+        self.journal(route_state='owned')
+        self.current()
+        if not self.inspect()[0]:
+            raise HostFailure('host-operation')
+        self.interval()
+
+    def start(self):
+        # A killed helper leaves these records behind deliberately. Never
+        # turn a restart into another scan of potentially occupied rmnet's.
+        if self.state['generation'] != 0 or self.state['phase'] != 'active' \
+                or self.state['binding'] is not None \
+                or any(os.path.lexists(p) for p in (lifecycle.ACK, lifecycle.LEASE, lifecycle.OWNED, INTERFACE)):
+            try:
+                self.cleanup_previous()
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                self.uncertain = True
+            self.fail('initialization-failed')
+            return False
+        self.lease()
+        address, dns = lifecycle.configuration(self.state)
+        def eligible(dev):
+            routes = json.loads(run('ip', '-j', '-4', 'route', 'show', 'table', 'all'))
+            if any(route.get('dev') == dev for route in routes):
+                return False
+            if self.binding is not None:
+                # Legacy discovery's failed candidate cleanup must actually
+                # have completed before its reservation can be replaced.
+                info = json.loads(run('ip', '-j', 'address', 'show', 'dev', self.dev))[0]
+                if info['addr_info'] or any(route.get('dev') == self.dev for route in routes):
+                    raise HostFailure('host-operation')
+            info = json.loads(run('ip', '-j', 'address', 'show', 'dev', dev))[0]
+            self.binding = dict(dev=dev, ifindex=info['ifindex'])
+            self.claim(self.state['response_hex'], address_state='adding', route_state='adding')
+            return True
+        dev = find_device(address, self.state['cid'],
+                          probe=lambda d: transport_proof(d, address, self.permitted),
+                          stopped=lambda: not self.permitted(), eligible=eligible)
+        info = json.loads(run('ip', '-j', 'address', 'show', 'dev', dev))[0]
+        self.binding = dict(dev=dev, ifindex=info['ifindex'])
+        self.address, self.dns = address, dns
+        self.journal(address_state='owned', route_state='owned')
+        self.current()
+        self.inspect()
+        self.set_dns(not self.inspect()[1])
+        self.interval()
+        self.available = True
+        lifecycle.publish_ack(self.state, 'applied', binding=self.binding)
+        self.lease()
+        return True
+
+    def cleanup_previous(self):
+        """A restarted process may clean proven ownership, never resume it.
+
+        The journal survives an ACK gap and a changed-IP generation. An
+        unfinished address add is ambiguous: retain evidence and the saved
+        binding, fail unavailable, and leave recovery to a guarded reboot.
+        """
+        # Preserve a separately validated binding even if the ownership
+        # journal is damaged. It authorizes no cleanup without that journal.
+        self.binding = self.state['binding']
+        ack, lease = lifecycle.read_ack(), lifecycle.read_lease(max_age=None)
+        if (ack and lease and ack['epoch'] == lease['epoch'] == self.state['epoch']
+                and ack['cid'] == lease['cid'] == self.state['cid']
+                and ack['binding'] == lease['binding']
+                and self.binding in (None, ack['binding'])):
+            self.binding = ack['binding']
+        saved = lifecycle.read_host()
+        if saved is None:
+            self.uncertain = True
+            return
+        self.binding = dict(saved['binding'])
+        if (saved['epoch'] != self.state['epoch'] or saved['cid'] != self.state['cid']
+                or saved['generation'] > self.state['generation']
+                or self.state['binding'] not in (None, saved['binding'])):
+            raise HostFailure('binding-mismatch')
+        self.owned = saved
+        active = {key: saved[key] for key in ('version', 'epoch', 'generation', 'cid', 'binding', 'response_hex')}
+        active.update(phase='active', reason=None)
+        address, self.dns = lifecycle.configuration(active)
+        if saved['address_state'] == 'adding':
+            self.uncertain = True
+            return
+        self.address = address if saved['address_state'] in ('owned', 'removing') else None
+        self.saved_resolver()
+        self.quiesce()
+
+    def accept(self, state):
+        if state['epoch'] != self.state['epoch']:
+            raise HostFailure('epoch-changed')
+        if state['cid'] != self.state['cid']:
+            raise HostFailure('cid-changed')
+        if state['binding'] != self.binding:
+            raise HostFailure('binding-mismatch')
+        if state['generation'] != self.state['generation'] + 1:
+            raise HostFailure('stale-generation')
+        if state['phase'] == 'active' and (self.state['phase'] != 'quiesce' or not self.quiesced):
+            raise HostFailure('not-quiesced')
+        self.state = state
+        self.available = False
+        self.failed = False
+        self.retry_at = None
+        self.hold.cancel()
+
+    def apply(self):
+        if not self.permitted():
+            return  # no host mutation or proof during sleep/roaming
+        if not self.quiesced or self.address is not None:
+            raise HostFailure('not-quiesced')
+        self.inspect()
+        address, dns = lifecycle.configuration(self.state)
+        self.current()
+        self.claim(self.state['response_hex'], address_state='adding')
+        self.mutation('ip', 'addr', 'add', address + '/32', 'dev', self.dev)
+        self.address, self.dns = address, dns
+        self.journal(address_state='owned')
+        self.quiesced = False
+        self.set_dns(False)
+        self.current()
+        self.inspect()
+        if not self.permitted():
+            raise HostFailure('canceled')
+        if not transport_proof(self.dev, address, self.permitted):
+            raise HostFailure('proof-failed')
+        self.add_route()
+        self.set_dns(not self.inspect()[1])
+        self.current()
+        self.available = True
+        lifecycle.publish_ack(self.state, 'applied', binding=self.binding)
+        print('Cellular host configuration applied after bound transport proof', flush=True)
+
+    def watch(self):
+        # Reached only for the current, successfully applied generation.
+        self.current()
+        routed, others, _ = self.inspect()
+        if roaming_blocked():
+            self.drop_route()
+            self.release_dns()
+            self.retry_at = None
+            self.hold.cancel()
+            return
+        self.set_dns(routed and not others)
+        if self.hold.active:
+            if self.hold.returns(bool(others), time.monotonic()):
+                if not self.awake():
+                    self.hold.back_at = self.awake_at
+                else:
+                    self.add_route()
+            return
+        if not self.awake():
+            return
+        if not routed and not others:
+            self.add_route()
+            self.retry_at = None
+        elif not routed and self.retry_at is not None and time.monotonic() >= self.retry_at:
+            self.retries += 1
+            self.retry_at = (time.monotonic() + RECHECK_DELAYS[self.retries]
+                             if self.retries < len(RECHECK_DELAYS) else None)
+            if transport_proof(self.dev, self.address, self.permitted):
+                self.add_route()
+                self.retry_at = None
+        elif routed and time.monotonic() >= self.check_at:
+            before = self.seen
+            self.interval()
+            if looks_silent(True, before, self.seen) \
+                    and not transport_proof(self.dev, self.address, self.permitted):
+                self.current()
+                self.drop_route()
+                self.retries = 0
+                self.retry_at = time.monotonic() + RECHECK_DELAYS[0]
+
+    def tick(self):
+        try:
+            state = lifecycle.read_state()
+            if state is None:
+                raise HostFailure('invalid-state')
+            if state != self.state:
+                self.accept(state)
+            if self.failed:
+                return
+            if self.state['phase'] in ('quiesce', 'unavailable'):
+                if not self.quiesced:
+                    self.quiesce()
+                self.current()
+                phase = 'quiesced' if self.state['phase'] == 'quiesce' else 'unavailable'
+                lifecycle.publish_ack(self.state, phase, binding=self.binding)
+            elif not self.available:
+                self.apply()
+            else:
+                self.watch()
+        except Superseded:
+            # A new generation cannot inherit a partly applied old one.
+            self.available = False
+            try:
+                self.quiesce()
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+                self.fail('host-operation')
+        except HostFailure as error:
+            self.fail(str(error))
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            self.fail('host-operation')
+        finally:
+            self.lease()
+
+    def announced(self, sleeping):
+        if sleeping:
+            routed = self.inspect()[0] if self.binding is not None else False
+            if self.hold.announced(routed and self.available):
+                self.drop_route()
+        else:
+            self.hold.over(time.monotonic(), self.available and not roaming_blocked())
+            self.awake_at = time.monotonic() + HEALTH_INTERVAL
+            if self.retry_at is not None:
+                self.retry_at = max(self.retry_at, self.awake_at)
+        self.lease()
+
+    def close(self):
+        try:
+            if self.binding is not None:
+                self.quiesce()
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+            lifecycle.publish_ack(self.state, 'failed', binding=self.binding,
+                                  reason='host-operation')
+        else:
+            lifecycle.publish_ack(self.state, 'unavailable', binding=self.binding,
+                                  reason='helper-stopped')
+        finally:
+            self.lease(desired=False)
+
+
+def managed_main(state, stopped):
+    sleeps = SleepWatch()
+    network = ManagedNetwork(state)
+
+    def drain():
+        for sleeping in sleeps.wait(0):
+            network.announced(sleeping)
+    network.drain = drain
+    try:
+        if not network.start():
+            return
+        while not stopped() and cp.online():
+            drain()
+            network.tick()
+            for sleeping in sleeps.wait(.5):
+                network.announced(sleeping)
+    finally:
+        network.close()
+        sleeps.close()
+
+
 def main():
     os.umask(0o077)
     lock = os.open(paths.RUN / 'data-network.lock', os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    managed_stop = False
+
+    def stop_managed(*_):
+        nonlocal managed_stop
+        managed_stop = True
+    signal.signal(signal.SIGTERM, stop_managed)
+    signal.signal(signal.SIGINT, stop_managed)
+    managed = paths.config()['control'].getboolean('recover_data', False)
+    state = lifecycle.read_state()
+    if managed or state is not None:
+        try:
+            deadline = time.monotonic() + 180
+            while state is None and not managed_stop and time.monotonic() < deadline:
+                time.sleep(.5)
+                state = lifecycle.read_state()
+            if state is not None and not managed_stop:
+                managed_main(state, lambda: managed_stop)
+        finally:
+            os.close(lock)
+        return
     clear_stale()
     wait_for_bearer(60)
     data = RESPONSE.read_bytes()

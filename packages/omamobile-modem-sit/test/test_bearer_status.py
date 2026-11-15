@@ -74,14 +74,26 @@ class Fixture:
         self.state.write_text(json.dumps(dict(cid=3, session=0) if value is None else value))
         self.response.write_bytes(item() if response is None else response)
 
-    def read(self, owner=None):
+    def read(self, owner=None, **kwargs):
         owner = owner or Owner()
-        result = bearer_status.read_status(owner)
+        result = bearer_status.read_status(owner, **kwargs)
         self.assertEqual(owner.sent, [(0x0602, b'', 5)])
         return result
 
 
 class DiagnosticTests(Fixture, unittest.TestCase):
+    def test_private_inventory_identifies_other_cids_without_claiming_them(self):
+        payload = b'\2' + item(cid=4, pdp=1, v6=bytes(16)) + item(cid=2, pdp=2, v4=bytes(4))
+        result = self.read(Owner(payload), inventory=True)
+        self.assertEqual(result['owned_cid'], 3)
+        self.assertFalse(result['present'])
+        self.assertEqual(result['contexts'], [
+            dict(cid=2, status=0, active=2, pdp_type=2, ipv4_present=False, ipv6_present=True),
+            dict(cid=4, status=0, active=2, pdp_type=1, ipv4_present=True, ipv6_present=False)])
+        text = json.dumps(result)
+        for private in (PRIVATE.decode(), V4.hex(), V6.hex(), '192.0.2.1', '2001:db8:'):
+            self.assertNotIn(private, text)
+
     def test_all_supported_widths_and_both_active_states(self):
         for size in (132, 234, 239, 246, 280, 292):
             for active in (1, 2):
