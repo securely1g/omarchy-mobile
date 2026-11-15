@@ -4184,3 +4184,57 @@ resume timestamp from a fresh read-only journal query, rather than relying
 on a continuous stream. A new gated run can reuse the installed 0.3.37.4
 without package/image writes, but requires fresh approval for its reboot
 and sleep requests. Keep the once-per-boot recovery budget unchanged.
+
+### M6 measured repeat on installed 0.3.37.4: gated runbook (2026-11-14)
+
+This repeat is prepared offline and **not yet approved or executed**. Reuse
+the installed package and gda171 kernel. No package or image write is needed.
+The recorder waits until request +55 seconds, then reads the actual resume
+timestamp from a fresh journal query and verifies exactly one new suspend
+success with no new failure. It checks that resume, counters, uptime and
+interface remain consistent throughout observation. It makes no T0/+10
+measurement claim. A local monotonic deadline bounds observation to actual
+resume +180 seconds; remote TERM/KILL timeouts also bound each command.
+
+Fresh bearer reads and packet checks target resume +60/+120 seconds. Cached
+recovery state must be settled before the fresh GET, after it, before each
+probe and after all probes. A pending state permits cached observation only;
+partial packet failures remain failures. A missing or more than five-second
+late target remains incomplete. Active samples leave at least 30 seconds
+after completion before another starts. Offline fixtures cover normal and
+early wake, pending-state races, failed partial probes, changed sleep/reset
+context, command deadlines and missed measurements. These are recorder
+checks, not additional hardware results.
+
+Fresh approval must name this complete sequence:
+
+1. **Low risk, read-only:** repeat NV, power, temperature, UTC agreement,
+   RTC, s2idle, UFS, inhibitor, live data/IMS/SIM and smoke preflight. Pin
+   reviewed recorder hashes and current installed source. Stop for any
+   mismatch; this step changes no phone state.
+2. **Medium risk:** save the exact private original configuration, enable
+   the two reviewed control settings and suspend marker, then clean reboot
+   1 of 2. Require healthy generation 0/unspent availability, applied ACK
+   and fresh awake lease before any sleep. Keep automatic sleep off.
+3. **High risk:** up to two separately reviewed, attended 45-second RTC
+   requests on powered USB, through normal systemd hooks and inhibitors.
+   Announce NFC/screen changes and use the established watchdog and logs.
+   Cycle 2 requires a complete timely measured first pass, expected RTC
+   sleep, healthy data/control/IMS/SIM and kernel, generation 0, no pending
+   recovery and no spent attempt. Any recovery SETUP, refusal, unexpected
+   early wake, missing measurement or failure ends further sleep testing.
+   At most one explicitly approved daemon-owned same-CID SETUP is allowed
+   in the entire boot, using its original parameters and existing guards.
+   No manual SETUP, warm restart, forced suspend or replacement request.
+4. **Mandatory teardown:** on pass or stop, restore the exact original
+   configuration and normal sleep inhibitor, remove the test marker,
+   restore NFC and clear only the owned RTC alarm. Use reserved clean
+   reboot 2, then verify data/IMS/SIM, smoke, all six NV checksums, recovery
+   off, automatic sleep off, watchdog 0 and no pending alarm. A third reboot
+   requires new approval. If wake/reconnection is unverified by two minutes,
+   cease automated phone commands and involve the owner.
+
+The second request has its own evidence gate; this is not an automatic loop.
+Even two successful short sleeps would establish only the measured cases.
+Recovery remains unexercised unless an actual lost bearer triggers SETUP;
+general sleep reliability and power savings still require separate evidence.
