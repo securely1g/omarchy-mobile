@@ -3989,3 +3989,67 @@ IPv4 ping recovered (3/3), IMS registered, the private SIM query returned
 one stored number, required smoke checks passed with no new kernel errors, and
 all six protected radio/calibration partition checksums remained the same.
 Call/SMS wake, busy-refusal stress and power benchmarks were not run.
+
+### M6 cellular route recovery candidate (2026-11-14, not hardware-qualified)
+
+The failed run above also exposed two reproducible route-watch defects:
+returning from SleepHold reused the pre-sleep traffic baseline/deadline,
+and a route withdrawn behind Wi-Fi was never checked again in that boot.
+The local `omamobile-modem-sit` 0.3.37.2 candidate starts a fresh 30-second
+interval after restoring the route and allows three probes of the same
+owned interface, with retry gaps of 30, 60 and 120 seconds (approximately
+30, 90 and 210 seconds after withdrawal). A successful probe restores
+only the existing metric-700 fallback; no bearer setup, interface search,
+radio toggle or modem restart is attempted. Sleep and roaming still gate
+the rechecks. A subprocess failure consumes its probe attempt.
+
+These are userspace recovery fixes, not evidence that the packet stall is
+fixed: the saved bound ping failed about 113 seconds after the earlier
+wake. Keep kernel `7.3.0-rc6-omamobile-gda171eae4cb7` unchanged for this
+comparison. The private action `bearer-status` requests a fresh
+GET_DATA_CALL_LIST through sitd's existing owner and returns only numeric
+bearer state and address-presence/match booleans. It never changes a bearer
+or publishes addresses, APNs, DNS or raw payloads.
+
+Offline validation: 37 route-watch tests, 60 focused bearer/SIM/service
+tests and the full SIT package suite (including sit-sim) pass. Independent
+source review found no blocking issue. Hardware qualification is pending.
+
+Gated attended retest, automatic sleep off and powered USB connected:
+
+1. **Low risk, read-only:** verify all six NV checksums, charging, empty RTC
+   alarm, `[s2idle]`, UFS `spm_lvl` 5, each cellular service and the saved
+   rollback packages/configuration. Capture routes, interface counters and
+   source-audited `pktproc/status`/`pktproc_ul/status` decimal counters;
+   then bounded interface-bound ICMP and DNS-independent HTTPS. Stop if the
+   awake baseline or backup check fails. Rollback: no change was made.
+2. **Medium risk, new owner approval:** install only the signed reviewed
+   SIT package, preserve the existing carrier/audio configuration, enable
+   the previously tested `follow_screen` and modem-suspend opt-in, and take
+   one clean `systemctl reboot --reboot-argument=omamobile`. No kernel,
+   device package or boot-image write is part of this candidate. Start the
+   laptop log stream first. Pass: exact package/source hashes, same kernel,
+   fresh IMS registration, zero live calls, live SIM query and both data
+   probes work. Stop for any regression; do not restart the modem or sitd.
+3. **High risk, attended:** use the M6 RTC procedure for two separate
+   45-second `rtcwake -m no` alarms and normal
+   `systemctl --no-ask-password suspend`, without force or inhibitor bypass.
+   Announce screen changes first; keep the established runtime watchdog
+   and owner recovery buttons available. Require a real successful sleep,
+   its wake reason and completed systemd hooks. Before each sleep and at
+   wake/10/60/120 seconds, capture passive routes/counters first, then the
+   fresh private bearer query, then bound ICMP/HTTPS. A control query wakes
+   the link, so preserve that ordering and timestamps. Queue counters are
+   shared by bearers and alone do not prove internet delivery.
+4. **Stop/rollback:** no second sleep after lost data, registration, SIM
+   access or a new serious kernel error. Remove the opt-in, start the modem
+   sleep inhibitor, restore the saved configuration, NFC and runtime
+   watchdog; leave auto-sleep off. The approved sequence must include a
+   final clean reboot into this guarded configuration, on pass or failure,
+   followed by fresh data/IMS/SIM, smoke and NV checks. This is the second
+   reboot, or early recovery if testing stops. Further reboots and package
+   downgrades require separate approval. Never use a warm modem
+   restart, manual bearer recreation or route edits to turn a failed test
+   into a pass. If no wake after two minutes, stop probing and ask the owner
+   to recover with the buttons. Record actual outcomes before extending to
+   calls/SMS or power measurements.

@@ -10,6 +10,7 @@ it. No NV, SIM-write or raw-request command is exposed.
 
   {"action": "status"}                      modem, calls, audio
   {"action": "own-number"}                  private, read-only USIM number query
+  {"action": "bearer-status"}               private, read-only owned-bearer query
   {"action": "dial", "number": "+1..."}     an IMS voice call
   {"action": "accept"|"hangup"|"delete-call", "id": "..."}
   {"action": "dtmf", "id": "...", "keys": "12#"}
@@ -915,6 +916,16 @@ class Service:
                 raise RuntimeError('End the current call before reading the SIM number')
             from msisdn import read_numbers
             result = read_numbers(self.client)
+            self.pump()
+            return result
+        if action == 'bearer-status':
+            # On demand only; never add this comparison to published state.
+            if set(request) != {'action'}:
+                raise ValueError('The bearer status query takes no arguments')
+            if self.live():
+                raise RuntimeError('End the current call before reading bearer status')
+            from bearer_status import read_status
+            result = read_status(self.client)
             self.pump()
             return result
         if action == 'sms-list':

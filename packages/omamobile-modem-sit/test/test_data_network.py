@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: MIT
 import env  # noqa: F401  (paths and sys.path first)
+from contextlib import ExitStack, redirect_stdout
+import io
+import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import data_network
 from data_network import Resolver, SleepHold, configuration, counters, guarded, looks_silent, sleep_signal
 
@@ -97,6 +101,228 @@ class WatchTests(unittest.TestCase):
     def test_other_errors_still_end_the_service(self):
         def broken(): raise KeyError('dev')
         with self.assertRaises(KeyError): guarded(broken)
+
+
+class ResumeWatchTests(unittest.TestCase):
+    """Run the real watch loop with no network, device, bus or clock access."""
+
+    def run_watch(self, frames, probes=(), failed_stats_at=(), failed_add_at=(), add_delay=0):
+        commands, observed, probe_times = [], [], []
+        state = dict(now=0, stats=(100, 10), blocked=False, routes=[
+            dict(dev='rmnet2', metric=700), dict(dev='wlan0', metric=600)])
+        pending = iter(frames)
+        replies = iter(probes)
+        done = False
+
+        def run(*args):
+            commands.append((state['now'], args))
+            if args == ('ip', '-j', 'route', 'show', 'default'):
+                return json.dumps(state['routes']).encode()
+            if args == ('ip', '-j', '-s', 'link', 'show', 'dev', 'rmnet2'):
+                if state['now'] in failed_stats_at:
+                    raise subprocess.TimeoutExpired(args, 20)
+                rx, tx = state['stats']
+                return json.dumps([dict(stats64=dict(rx=dict(bytes=rx),
+                                                     tx=dict(packets=tx)))]).encode()
+            if args[:4] == ('ip', 'route', 'del', 'default'):
+                state['routes'] = [r for r in state['routes']
+                                   if not (r.get('dev') == 'rmnet2' and r.get('metric') == 700)]
+            elif args[:4] == ('ip', 'route', 'add', 'default'):
+                if state['now'] in failed_add_at:
+                    raise RuntimeError('Cellular network operation failed: ip')
+                state['routes'].append(dict(dev='rmnet2', metric=700))
+                state['now'] += add_delay
+            return b''
+
+        def probe(dev):
+            self.assertEqual(dev, 'rmnet2')  # never search/remap a live bearer
+            probe_times.append(state['now'])
+            result = next(replies)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        class Sleeps:
+            def wait(self, _):
+                nonlocal done
+                observed.append((state['now'], any(r.get('dev') == 'rmnet2'
+                                                   for r in state['routes'])))
+                frame = next(pending, None)
+                if frame is None:
+                    done = True
+                    return []
+                state.update({key: value for key, value in frame.items() if key != 'signals'})
+                return frame.get('signals', [])
+
+            def close(self):
+                pass
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, ExitStack() as stack:
+            response = Path(temp) / 'response'
+            response.write_bytes(b'\0\0\1')
+            replacements = {
+                'run': run, 'answers': probe, 'clear_stale': lambda: None,
+                'wait_for_bearer': lambda _: None,
+                'configuration': lambda _: ('192.0.2.10', ['192.0.2.53']),
+                'find_device': lambda *_, **__: 'rmnet2',
+                'resolver_for': lambda *_: Mock(), 'roaming_blocked': lambda: state['blocked'],
+                'SleepWatch': Sleeps, 'RESPONSE': response,
+                'INTERFACE': Path(temp) / 'interface',
+            }
+            for name, value in replacements.items():
+                stack.enter_context(patch.object(data_network, name, value))
+            stack.enter_context(patch.object(data_network.paths, 'RUN', Path(temp)))
+            stack.enter_context(patch.object(data_network.cp, 'online', lambda: not done))
+            stack.enter_context(patch.object(data_network.time, 'monotonic', lambda: state['now']))
+            stack.enter_context(patch.object(data_network.signal, 'signal'))
+            stack.enter_context(redirect_stdout(output))
+            old_umask = os.umask(0o077)
+            try:
+                data_network.main()
+            finally:
+                os.umask(old_umask)
+        return observed, probe_times, commands, output.getvalue()
+
+    def test_resume_uses_a_fresh_interval_and_counter_baseline(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=29, signals=[True]),
+            # The interrupted interval had TX but no RX. Wi-Fi is back, so
+            # SleepHold returns the route immediately, ahead of its grace.
+            dict(now=31, stats=(100, 20), signals=[False]),
+            dict(now=31.5), dict(now=60.9), dict(now=61),
+        ], probes=[False])
+        self.assertTrue(all(routed for now, routed in observed if now >= 31))
+        self.assertEqual(probes, [])
+
+    def test_withdrawn_route_is_retried_without_displacing_wifi(self):
+        observed, probes, commands, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)),  # failed health probe withdraws it
+            dict(now=59.9), dict(now=60), dict(now=60.5),
+        ], probes=[False, True])
+        self.assertEqual(probes, [30, 60])
+        self.assertIn((59.9, False), observed)
+        self.assertIn((60.5, True), observed)
+        self.assertTrue(all('wlan0' not in args for _, args in commands))
+
+    def test_new_silent_traffic_after_the_grace_still_withdraws_the_route(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=29, signals=[True]),
+            dict(now=31, stats=(100, 20), signals=[False]),
+            dict(now=31.5, stats=(100, 21)), dict(now=60.9), dict(now=61),
+        ], probes=[False])
+        self.assertEqual(probes, [61])
+        self.assertIn((60.9, True), observed)
+        self.assertIn((61, False), observed)
+
+    def test_slow_route_add_does_not_shorten_the_resume_health_interval(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=29, signals=[True]),
+            dict(now=31, stats=(100, 20), signals=[False]),
+            dict(now=51.5, stats=(100, 21)), dict(now=80.9), dict(now=81),
+        ], probes=[False], add_delay=20)
+        self.assertEqual(probes, [81])
+        self.assertIn((80.9, True), observed)
+        self.assertIn((81, False), observed)
+
+    def test_failed_stats_read_does_not_lose_a_sleep_held_route(self):
+        observed, probes, _, output = self.run_watch([
+            dict(now=29, signals=[True]), dict(now=31, signals=[False]),
+            dict(now=33), dict(now=64),
+        ], failed_stats_at={31})
+        self.assertEqual(probes, [])
+        self.assertIn((31, False), observed)
+        self.assertIn((33, True), observed)
+        self.assertIn('Network checks work again', output)
+
+    def test_rechecks_are_bounded_and_never_reinstate_an_unresponsive_bearer(self):
+        observed, probes, _, output = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60), dict(now=120),
+            dict(now=240), dict(now=500), dict(now=1000),
+        ], probes=[False, False, False, False])
+        self.assertEqual(probes, [30, 60, 120, 240])
+        self.assertTrue(all(not routed for now, routed in observed if now >= 30))
+        self.assertEqual(output.count('rechecks exhausted'), 1)
+
+    def test_probe_errors_also_consume_the_bounded_retry_budget(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60), dict(now=61),
+            dict(now=120), dict(now=121), dict(now=240), dict(now=241), dict(now=500),
+        ], probes=[False] + [subprocess.TimeoutExpired(('ping',), 10)] * 3)
+        self.assertEqual(probes, [30, 60, 120, 240])
+        self.assertTrue(all(not routed for now, routed in observed if now >= 30))
+
+    def test_initial_probe_error_does_not_retry_each_watch_pass(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=30.5, stats=(100, 21)),
+            dict(now=31), dict(now=59.9), dict(now=60),
+        ], probes=[subprocess.TimeoutExpired(('ping',), 10), True])
+        self.assertEqual(probes, [30, 60])
+        self.assertTrue(all(routed for _, routed in observed))
+
+    def test_recheck_waits_through_sleep_and_a_full_interval_after_resume(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)),
+            dict(now=59, signals=[True]), dict(now=60), dict(now=65),
+            dict(now=70, signals=[False]), dict(now=99.9), dict(now=100),
+        ], probes=[False, True])
+        self.assertEqual(probes, [30, 100])
+        self.assertIn((99.9, False), observed)
+        self.assertIn((100, True), observed)
+
+    def test_roaming_prohibition_cancels_pending_rechecks(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=59, blocked=True),
+            dict(now=60), dict(now=100, blocked=False), dict(now=200),
+        ], probes=[False])
+        self.assertEqual(probes, [30])
+        self.assertTrue(all(not routed for now, routed in observed if now >= 30))
+
+    def test_no_wifi_still_restores_a_route_after_the_sleep_grace(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=29, signals=[True]),
+            dict(now=31, stats=(100, 20), routes=[], signals=[False]),
+            dict(now=40.9), dict(now=41), dict(now=71),
+        ])
+        self.assertEqual(probes, [])
+        self.assertIn((40.9, False), observed)
+        self.assertIn((41, True), observed)
+
+    def test_a_successful_recheck_excludes_probe_traffic_from_the_next_interval(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60, stats=(100, 22)),
+            dict(now=60.5), dict(now=90),
+        ], probes=[False, True])
+        self.assertEqual(probes, [30, 60])
+        self.assertIn((90, True), observed)
+
+    def test_failed_final_route_add_retries_only_ip_not_another_probe(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60), dict(now=120),
+            dict(now=240), dict(now=242), dict(now=272),
+        ], probes=[False, False, False, True], failed_add_at={240})
+        self.assertEqual(probes, [30, 60, 120, 240])
+        self.assertIn((240, False), observed)
+        self.assertIn((242, True), observed)
+        self.assertIn((272, True), observed)
+
+    def test_pending_ip_restore_also_waits_through_sleep(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60),
+            dict(now=61, signals=[True]), dict(now=62),
+            dict(now=70, signals=[False]), dict(now=99.9), dict(now=100),
+        ], probes=[False, True], failed_add_at={60})
+        self.assertEqual(probes, [30, 60])
+        self.assertIn((99.9, False), observed)
+        self.assertIn((100, True), observed)
+
+    def test_roaming_cancels_a_pending_ip_restore(self):
+        observed, probes, _, _ = self.run_watch([
+            dict(now=30, stats=(100, 20)), dict(now=60),
+            dict(now=61, blocked=True), dict(now=100, blocked=False),
+        ], probes=[False, True], failed_add_at={60})
+        self.assertEqual(probes, [30, 60])
+        self.assertTrue(all(not routed for now, routed in observed if now >= 30))
 
 
 class DeviceTests(unittest.TestCase):
