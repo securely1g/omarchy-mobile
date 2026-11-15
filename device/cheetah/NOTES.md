@@ -2,6 +2,20 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-11-14: the cellular resume retest lost its owned internet bearer
+
+An additional cheetah tested local SIT 0.3.37.2-1 on
+`7.3.0-rc6-omamobile-gda171eae4cb7`, with powered USB and automatic sleep
+off. Awake data/IMS/SIM and required smoke checks passed. Its first actual
+sleep woke early after about four seconds on `cp2ap_wakeup`. At the first
+check, about 24 seconds after resume, the fresh modem list omitted owned
+internet CID 3; bound ICMP and HTTPS failed while the cellular route was
+still present. The second sleep was skipped. The approved final clean
+reboot with original config and sleep inhibited recovered data, IMS and
+SIM; smoke passed and all six protected radio/calibration checksums were
+unchanged. Modem-online sleep remains unqualified. Details and limits are
+in [MODEM-PLAN](MODEM-PLAN.md#m6-route-recovery-retest-owned-internet-bearer-disappeared-2026-11-14).
+
 ## 2026-11-13: the release kernel kernel-2026.11.13 boots, power off stays off, double tap wakes from sleep
 
 `kernel-2026.11.13` is linux-omarchy-mobile's `omamobile` at `36d61a33795b`:
