@@ -4251,8 +4251,9 @@ and sleep requests. Keep the once-per-boot recovery budget unchanged.
 
 ### M6 measured repeat on installed 0.3.37.4: gated runbook (2026-11-14)
 
-This repeat is prepared offline and **not yet approved or executed**. Reuse
-the installed package and gda171 kernel. No package or image write is needed.
+This repeat was prepared offline; its subsequent approved result is recorded
+below. Reuse the installed package and gda171 kernel. No package or image
+write is needed.
 The recorder waits until request +55 seconds, then reads the actual resume
 timestamp from a fresh journal query and verifies exactly one new suspend
 success with no new failure. It checks that resume, counters, uptime and
@@ -4302,3 +4303,55 @@ The second request has its own evidence gate; this is not an automatic loop.
 Even two successful short sleeps would establish only the measured cases.
 Recovery remains unexercised unless an actual lost bearer triggers SETUP;
 general sleep reliability and power savings still require separate evidence.
+
+### M6 measured retest: data healthy, recovery unexercised (2026-11-15)
+
+The approved sequence reused installed SIT 0.3.37.4, source `e3b71e1`, and
+`7.3.0-rc6-omamobile-gda171eae4cb7`. It used two clean reboots and two
+separately gated sleep requests, with no package or image write. Awake
+acceptance verified all 25 installed Python/launcher hashes, applied ACK 0,
+fresh awake lease, pinned interface, data, IMS/SIM and required smoke checks.
+
+| Cycle | Actual sleep / wake | Independent data checks after resume | Recovery |
+| --- | --- | --- | --- |
+| 1 | 43.264 seconds, RTC IRQ 109; success 1/fail 0 | +60.288 and +120.270 seconds: fresh matching bearer, both bound ICMP targets and HTTPS 200 passed | Generation 0, unspent |
+| 2 | 5.227 seconds, early modem IRQ 160; cumulative success 2/fail 0 | +60.270 and +120.274 seconds: the same independent checks passed | Generation 0, unspent |
+
+The recorder obtained the actual resume timestamps independently of the
+continuous stream. Neither cycle missed its scheduled data readings. The
+first cached observation was approximately resume +10 seconds for cycle 1
+and +48 seconds for cycle 2; there are no T0 readings. Cycle 1's cached
+availability was false during the initial host awake grace and true by
+approximately +30 seconds. No external live probe was sent while unavailable.
+
+Cycle 1 met the evidence gate for cycle 2. **Cycle 2 is an early-wake result,
+not a second full RTC pass.** No replacement request was made. All four
+services, IMS/SIM, the private number query (status/count only), ownership,
+ACK and lease checks remained healthy after each cycle. Unit logs contain
+only the two ordinary cold-start SETUPs, with **zero recovery SETUPs**.
+The observed sleeps did not reproduce the missing internet bearer. Healthy
+scheduled checks do not prove that every intervening packet would pass,
+and they do not validate a recovery path that was never exercised.
+
+Keep the smoke findings visible. Cycle 2 added two unclassified error-level
+CPIF lines: a wake work item pending during suspend and its replay afterward.
+On the installed kernel these are the `ap_wakeup_handler` deferral and
+`PM_POST_SUSPEND` replay paths in `modem_ctrl_s5100.c`, not failure returns.
+The final cold boot added three optional smoke findings: two IRQ-already-active
+messages from the duplicate-enable guard and a missing SBD-IPC attribute
+message from the startup branch that skips SBD initialization and continues
+IPC setup. Source review identifies their branches; no error filter was
+changed. Required smoke checks passed, with no oops or WARN, but this is
+not a blanket claim of zero new error-level messages.
+
+The mandatory final reboot restored the exact original configuration and
+verified recovery disabled, normal modem sleep-block inhibitor actually
+held, suspend marker absent, automatic sleep off, NFC services and original
+power/polling state restored, watchdog 0 and no pending RTC alarm. Fresh
+data/IMS/SIM, all four units, installed hashes and required smoke passed;
+all six protected radio/calibration checksums remained unchanged.
+
+The bounded sequence is complete. Modem-online sleep remains unqualified
+and blocked. The next recovery qualification needs an actual reproduced
+bearer loss followed by a successful guarded SETUP and independent packet
+proof; these retained-bearer cases cannot substitute for that evidence.
