@@ -4113,3 +4113,36 @@ Gated attended run, **fresh approval required**:
 The first run can only establish a bounded recovery regression result.
 One-attempt-per-boot protection, early wakes, call/SMS wake, repeated sleep
 reliability and power consumption remain separate qualification work.
+
+### M6 recovery 0.3.37.3 stopped at awake host validation (2026-11-14)
+
+An attended activation of source `b0e59ce`, with the same gda171 kernel,
+reached IMS registration and a successful fresh all-CID baseline. The host
+found CID 3 on rmnet2 with bound ICMP/TCP proof, then rejected its address
+list before initial ACK 0. The traceback points to `ManagedNetwork.inspect`
+and its strict address predicate. The helper stopped; the controller
+reported unavailable, unspent and not uncertain, and its independent
+permanent sleep-block guard was verified held.
+
+No RTC request, actual sleep or recovery SETUP was performed. Logs show
+only the two ordinary cold-start SETUP replies. The exact original config
+and normal sleep guard were restored, then the second approved clean reboot
+recovered data. Fresh ICMP/HTTPS, IMS/SIM, all four units and required smoke
+passed; all six NV checksums were unchanged. Recovery is disabled, automatic
+sleep off, NFC restored, watchdog 0 and RTC empty.
+
+The guarded boot's address metadata shows the owned IPv4 /32 plus Linux's
+automatic IPv6 link-local: `inet6`, link scope, /64, protocol `kernel_ll`.
+That shape reproduces the validator rejection offline. The failed boot's
+full address list was not captured, so the saved traceback and this later
+address observation remain distinct evidence.
+
+Local candidate 0.3.37.4 narrowly preserves explicitly kernel-generated
+link-local IPv6 while counting/altering only its owned IPv4. It requires
+the family, link scope, /64, actual link-local value and explicit matching
+`kernel_ll` provenance. Missing/conflicting provenance, global/ULA IPv6,
+extra IPv4 and foreign routes still refuse. Nothing flushes or disables
+IPv6. Fixtures cover initial ACK, quiescence, changed-IP reload, cleanup,
+restart and the actual daemon/host round trip with the kernel-style address.
+The same gated one-sleep/one-recovery-SETUP/two-reboot runbook applies only
+after a new signed build, offline gates and explicit owner approval.

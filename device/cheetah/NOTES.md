@@ -2,6 +2,19 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-11-14: guarded recovery stopped before sleep at host address validation
+
+Local SIT 0.3.37.3 on `7.3.0-rc6-omamobile-gda171eae4cb7` reached a healthy
+modem baseline, but the new host address predicate rejected the interface
+before initial ACK 0. The controller spent no recovery attempt and held its
+strong guard; no sleep was requested. A guarded final reboot restored data,
+IMS/SIM and required smoke checks, with all six NV checksums unchanged.
+The recovered interface's kernel-generated IPv6 link-local shape reproduces
+the rejection offline; 0.3.37.4 preserves only that explicitly marked shape.
+The failed boot's address list was not captured. This is an awake validator
+fix, with sleep/recovery qualification still pending; details are in
+[MODEM-PLAN](MODEM-PLAN.md#m6-recovery-03373-stopped-at-awake-host-validation-2026-11-14).
+
 ## 2026-11-14: the cellular resume retest lost its owned internet bearer
 
 An additional cheetah tested local SIT 0.3.37.2-1 on
