@@ -3951,3 +3951,41 @@ panel goes dark; then M6.4 (20 sleeps through the shell's auto-sleep, the
 modem registered and a ping over `rmnet` after each, no UFS line) and M6.5
 (a day of use with the modem up). Then DEVICES' Suspend cell moves to
 "works".
+
+### M6 stopped after cellular data failed following the second sleep (2026-11-14, America/Los_Angeles)
+
+An additional Pixel 7 Pro (cheetah), attended and on USB power, ran kernel
+`7.3.0-rc6-omamobile-gda171eae4cb7` (merged [linux-omarchy-mobile#232](https://github.com/derekross/linux-omarchy-mobile/pull/232)).
+Packages: `linux-omamobile` 7.3.0rc6.r830.gda171eae4cb7-1,
+`omamobile-modem-sit` 0.3.37.1-1, `omamobile-modem` 0.1.25.1-1 and
+`omamobile-device-cheetah` 0.1.56.1-1. Omarchy and the shell were unchanged.
+
+Three awake boots passed the required smoke checks, live cellular IPv4
+ping 3/3, IMS voice/SMS registration and the private SIM-number query
+(`available`, one number; value omitted). With `follow_screen` enabled,
+screen-off/on requests were acknowledged and optional `0906` indication
+counts stayed flat while dark.
+
+Two RTC sleeps ran through normal `systemctl suspend`, with hooks and
+inhibitors respected. The first woke on IRQ 109 and data passed 3/3.
+The second request was initially refused with -EBUSY before the freeze,
+then slept and woke on the RTC: cumulative success 2, fail 1. Afterward,
+cellular ping received 0/3 replies, while the live SIM query still answered.
+
+The route monitor observed TX without RX and failed probes, then removed
+the metric-700 default. Read-only checks found the interface up, its IPv4
+configuration matching the bearer record, and an explicitly bound route
+lookup succeeding. Indication counts `0804` and `074a` were zero, without
+a pre-test snapshot. The cause remains undetermined.
+
+No D3cold-to-D0 failure, BME failure, UFS error-handler, I/O error or oops was found. The known
+s2idle DME-set `0x4021` messages appeared in both cycles.
+
+**Sleep qualification failed.** Testing stopped: opt-in removed, inhibitor
+active, original configuration restored, auto-sleep off, NFC and runtime
+watchdog (0) restored. A separately approved clean recovery reboot kept the installed r830 images,
+with suspend inhibited and the original configuration restored. Cellular
+IPv4 ping recovered (3/3), IMS registered, the private SIM query returned
+one stored number, required smoke checks passed with no new kernel errors, and
+all six protected radio/calibration partition checksums remained the same.
+Call/SMS wake, busy-refusal stress and power benchmarks were not run.
