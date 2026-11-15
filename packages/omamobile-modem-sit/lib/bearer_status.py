@@ -39,7 +39,7 @@ def _ownership():
     return cid, setup, None
 
 
-def read_status(client):
+def read_status(client, *, inventory=False):
     """Return only fixed labels, owned-CID integers and presence/match flags.
 
     Unknown ownership still permits the read, but cannot claim a returned
@@ -66,6 +66,14 @@ def read_status(client):
     except (RuntimeError, ValueError, TypeError):
         return dict(result, reason='unsupported-layout')
     result.update(status='unknown', source='modem')
+    if inventory:
+        # Private diagnostics need to distinguish a remaining IMS/attach
+        # context from a newly numbered bearer, without exposing addresses
+        # or asserting ownership from the list itself.
+        result['contexts'] = [dict(cid=item[2], status=struct.unpack_from('<H', item)[0],
+                                   active=item[3], pdp_type=item[4],
+                                   ipv4_present=any(item[5:9]), ipv6_present=any(item[9:25]))
+                              for item in sorted(items, key=lambda value: value[2])]
     if cid is None:
         return dict(result, reason=reason)
     item = next((item for item in items if item[2] == cid), None)
