@@ -2,6 +2,19 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-11-15: measured sleep checks kept data; recovery was not exercised
+
+Installed SIT 0.3.37.4 on `7.3.0-rc6-omamobile-gda171eae4cb7` completed an
+approximately 43-second RTC sleep and a second, approximately five-second
+early modem wake. Both had fresh matching bearers, bound ICMP and HTTPS 200
+at the scheduled +60/+120-second checks. No recovery SETUP occurred;
+the second cycle is not a full RTC pass and automatic repair remains
+unproven. Required smoke checks passed; optional CPIF deferred-wake and
+cold-start diagnostic findings remain recorded without changing filters.
+The final clean reboot restored the exact original guarded configuration,
+verified data/IMS/SIM and all six unchanged NV checksums, with recovery and
+automatic sleep off. See [MODEM-PLAN](MODEM-PLAN.md#m6-measured-retest-data-healthy-recovery-unexercised-2026-11-15).
+
 ## 2026-11-14: 0.3.37.4 woke on the RTC; early measurements were missed
 
 SIT 0.3.37.4 on `7.3.0-rc6-omamobile-gda171eae4cb7` passed awake host
