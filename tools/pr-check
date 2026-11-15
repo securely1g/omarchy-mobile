@@ -105,7 +105,9 @@ tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
 while IFS= read -r f; do
   git show "$head:$f" > "$tmp" 2>/dev/null || continue
-  first=$(head -c 64 "$tmp" | head -1)
+  # Read a bounded first line without an early-closing pipeline (SIGPIPE).
+  first=
+  IFS= read -r -n64 first < "$tmp" || true
   case $first in
     '#!/bin/bash'*|'#!/usr/bin/env bash'*) bash -n "$tmp" 2>/dev/null || broken+="$f"$'\n' ;;
     '#!/bin/sh'*|'#!/bin/busybox sh'*) sh -n "$tmp" 2>/dev/null || broken+="$f"$'\n' ;;
