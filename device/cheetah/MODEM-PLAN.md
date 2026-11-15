@@ -4013,7 +4013,7 @@ or publishes addresses, APNs, DNS or raw payloads.
 
 Offline validation: 37 route-watch tests, 60 focused bearer/SIM/service
 tests and the full SIT package suite (including sit-sim) pass. Independent
-source review found no blocking issue. Hardware qualification is pending.
+source review found no blocking issue. The hardware retest below failed.
 
 Gated attended retest, automatic sleep off and powered USB connected:
 
@@ -4053,3 +4053,50 @@ Gated attended retest, automatic sleep off and powered USB connected:
    into a pass. If no wake after two minutes, stop probing and ask the owner
    to recover with the buttons. Record actual outcomes before extending to
    calls/SMS or power measurements.
+
+### M6 route-recovery retest: owned internet bearer disappeared (2026-11-14)
+
+The attended retest used SIT 0.3.37.2-1 (source `ed0f4b3`) and the same
+`7.3.0-rc6-omamobile-gda171eae4cb7` kernel, modem and device packages.
+Only SIT was installed; no boot images were written. Awake acceptance
+passed: required smoke checks, all four cellular units, fresh IMS and SIM
+query, active CID 3 matching its saved setup, both bound ICMP targets and
+DNS-independent HTTPS (200).
+
+One RTC alarm was armed for 45 seconds. Normal systemd suspend actually
+slept about four seconds, then woke early on IRQ 160 (`cp2ap_wakeup`):
+success 1, fail 0. The first passive post-wake sample was about 24 seconds
+after resume; no immediate/+10-second observation is claimed. Some traffic
+arrived between the pre-sleep and first post-wake snapshots (RX packets
+21 to 40).
+
+At that first check a fresh GET_DATA_CALL_LIST succeeded but omitted owned
+internet CID 3. Its response contained one bearer, compared with two in
+the awake baseline; the remaining bearer's identity was not exposed by
+this diagnostic. Both bound ICMP targets and HTTPS then failed while the
+metric-700 route was still present. During those probes TX increased five
+packets and RX stayed flat; the uplink queue consumed its descriptors and
+downlink queues had no pending drain backlog. The monitor withdrew the
+route later. This is not proof of a kernel queue defect.
+
+Packet registration remained accepted. The poll reported RAT 14 (LTE) to
+20 (LTE-CA) around the loss, then back to 14; that correlation does not
+explain the withdrawal. No runtime radio-off, deactivation request, daemon
+exit or new serious kernel/storage error was found. The known DME-set
+`0x4021` message appeared once.
+
+**Qualification failed; cycle 2 was skipped.** The guard and exact original
+configuration were restored immediately after failure, then the second
+approved clean reboot recovered the internet bearer. Both ICMP targets,
+HTTPS, fresh IMS/SIM query, all four units and required smoke checks passed;
+all six protected radio/calibration checksums remained unchanged. NFC was
+restored, watchdog returned to 0, the test RTC alarm was empty, automatic
+sleep remained off and the modem sleep inhibitor was active.
+
+The route-monitor fixes do not repair a withdrawn modem bearer. Runtime
+`0604` currently only updates a cache; ownership-file existence still
+advertises data and the host helper retains its startup configuration.
+Next work needs separately reviewed owned-bearer reconciliation, preserving
+the reservation and accounting for all other contexts before any recovery
+SETUP. No blind bearer recreation or further phone write is authorized by
+the completed two-reboot test sequence.
