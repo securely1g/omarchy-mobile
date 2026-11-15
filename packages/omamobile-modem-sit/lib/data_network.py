@@ -19,7 +19,8 @@ is recorded in RAM (data-interface) for the bearer's release.
 
 The carrier's DNS is used only while the bearer is the only way out. A bearer
 that sends but receives nothing, and then answers no ping either, loses its
-default route, and gets it back as soon as nothing else is left: otherwise a
+default route. A bounded set of probes on that same device can restore it
+behind Wi-Fi; it also gets it back as soon as nothing else is left. Otherwise a
 dead bearer's route plus its DNS can outlive a short Wi-Fi outage, make
 NetworkManager's connectivity check fail through it and keep the phone
 offline with Wi-Fi up.
@@ -48,6 +49,10 @@ RESOLVER = Path('/etc/resolv.conf')
 INTERFACE = paths.RUN / 'data-interface'
 # rmnet0-rmnet7 are tried; CPIF creates 30, a phone uses a handful.
 CANDIDATES = 8
+HEALTH_INTERVAL = 30
+# A budget per withdrawal: a transient loss must not withdraw the fallback
+# for the rest of the boot, but a broken bearer is not polled forever.
+RECHECK_DELAYS = (30, 60, 120)
 
 
 def run(*args):
@@ -416,11 +421,30 @@ def main():
         print('Cellular fallback ready; Wi-Fi remains preferred', flush=True)
         last = None
         seen = counters(json.loads(run('ip', '-j', '-s', 'link', 'show', 'dev', dev)))
-        check_at = time.monotonic() + 30
+        check_at = time.monotonic() + HEALTH_INTERVAL
+        retry_at = None
+        retries = 0
+        restore_at = None
         hold = SleepHold()
 
+        def fresh_interval():
+            nonlocal seen, check_at
+            # No traffic from before the sleep (or while its route was
+            # withheld) belongs to the next health interval.
+            seen = counters(json.loads(run('ip', '-j', '-s', 'link', 'show', 'dev', dev)))
+            check_at = time.monotonic() + HEALTH_INTERVAL
+
+        def restore_answered(routed):
+            nonlocal restore_at, check_at
+            fresh_interval()
+            if not routed:
+                run('ip', 'route', 'add', 'default', 'dev', dev, 'src', address, 'metric', '700')
+            check_at = time.monotonic() + HEALTH_INTERVAL
+            restore_at = None
+            print('Cellular bearer answered; its fallback route is back', flush=True)
+
         def watch():
-            nonlocal last, seen, check_at
+            nonlocal last, seen, check_at, retry_at, retries, restore_at
             routes = json.loads(run('ip', '-j', 'route', 'show', 'default'))
             routed = any(r.get('dev') == dev for r in routes)
             others = [r for r in routes if r.get('dev') != dev]
@@ -430,6 +454,8 @@ def main():
                     print('Roaming with data roaming off; the cellular default route is removed', flush=True)
                 resolver.update(False, dns)
                 hold.cancel()
+                retry_at = None
+                restore_at = None
                 last = None
                 return
             # With Wi-Fi up but rated limited, the carrier's DNS would keep
@@ -441,25 +467,76 @@ def main():
                 last = cellular
             if hold.active:
                 if hold.returns(bool(others), time.monotonic()):
-                    if not routed:
-                        run('ip', 'route', 'add', 'default', 'dev', dev, 'src', address, 'metric', '700')
+                    try:
+                        fresh_interval()
+                        if not routed:
+                            run('ip', 'route', 'add', 'default', 'dev', dev, 'src', address, 'metric', '700')
+                        check_at = time.monotonic() + HEALTH_INTERVAL
+                        restore_at = None
+                    except (subprocess.SubprocessError, RuntimeError, ValueError):
+                        # The hold is not fulfilled until both operations
+                        # succeed; a failed stats read must not lose it.
+                        hold.back_at = time.monotonic()
+                        raise
                     print('The cellular default route is back', 'behind Wi-Fi' if others else 'as the only way out', flush=True)
                     last = None
                 return
+            if restore_at is not None:
+                if time.monotonic() >= restore_at:
+                    restore_answered(routed)
+                return
             if not routed and not others:
+                fresh_interval()
                 run('ip', 'route', 'add', 'default', 'dev', dev, 'src', address, 'metric', '700')
+                check_at = time.monotonic() + HEALTH_INTERVAL
                 print('Nothing else leads out; the cellular default route is back', flush=True)
+                retry_at = None
+            elif not routed and retry_at is not None and time.monotonic() >= retry_at:
+                # An explicit interface bind uses this existing rmnet even
+                # without its default route. Never re-run find_device here:
+                # another rmnet may carry IMS or a modem-owned attach bearer.
+                retries += 1
+                # Consume the attempt before probing; a subprocess error is
+                # bounded too, rather than retried every watch iteration.
+                retry_at = (time.monotonic() + RECHECK_DELAYS[retries]
+                            if retries < len(RECHECK_DELAYS) else None)
+                print('Rechecking the cellular bearer:', retries, 'of', len(RECHECK_DELAYS), flush=True)
+                if answers(dev):
+                    retry_at = None
+                    # A failed ip operation can be retried without spending
+                    # another probe, even when this was the last attempt.
+                    restore_at = time.monotonic()
+                    restore_answered(routed)
+                elif retry_at is None:
+                    print('Cellular bearer still answers no probe; rechecks exhausted, route remains removed', flush=True)
+                else:
+                    print('Cellular bearer still answers no probe; route remains removed', flush=True)
             elif time.monotonic() >= check_at:
                 now = counters(json.loads(run('ip', '-j', '-s', 'link', 'show', 'dev', dev)))
-                if looks_silent(routed, seen, now) and not answers(dev):
+                silent = looks_silent(routed, seen, now)
+                # Even a probe subprocess failure gets a full interval,
+                # not another attempt on the next half-second watch pass.
+                seen = now
+                check_at = time.monotonic() + HEALTH_INTERVAL
+                if silent and not answers(dev):
                     run('ip', 'route', 'del', 'default', 'dev', dev, 'metric', '700')
                     print('Cellular bearer carries nothing; its default route is removed', flush=True)
+                    retries = 0
+                    retry_at = time.monotonic() + RECHECK_DELAYS[0]
                     now = counters(json.loads(run('ip', '-j', '-s', 'link', 'show', 'dev', dev)))
                 seen = now
-                check_at = time.monotonic() + 30
+                check_at = time.monotonic() + HEALTH_INTERVAL
         def announced(state):
+            nonlocal retry_at, restore_at
             if not state:
+                was_sleeping = hold.sleeping
                 hold.over(time.monotonic(), not roaming_blocked())
+                # A withdrawn route has no SleepHold return, but its next
+                # probe must still wait for the post-resume grace.
+                if was_sleeping and retry_at is not None:
+                    retry_at = max(retry_at, time.monotonic() + HEALTH_INTERVAL)
+                if was_sleeping and restore_at is not None:
+                    restore_at = max(restore_at, time.monotonic() + HEALTH_INTERVAL)
                 return
             routes = json.loads(run('ip', '-j', 'route', 'show', 'default'))
             routed = any(r.get('dev') == dev and r.get('metric') == 700 for r in routes)
