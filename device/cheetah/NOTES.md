@@ -2,6 +2,17 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
+## 2026-11-14: 0.3.37.4 woke on the RTC; early measurements were missed
+
+SIT 0.3.37.4 on `7.3.0-rc6-omamobile-gda171eae4cb7` passed awake host
+acceptance and completed one roughly 44-second RTC-woken sleep. The SSH
+stream's keepalive expired during the freeze, so the planned early data
+checks were missed. A late check at wake +424 seconds passed bound ICMP and
+HTTPS with a matching active internet bearer. No recovery SETUP was sent.
+This does not qualify guarded recovery or uninterrupted data. The final
+guarded reboot restored the original settings and verified data/IMS/SIM,
+smoke and all six NV checksums. See [MODEM-PLAN](MODEM-PLAN.md#m6-03374-rtc-wake-and-late-healthy-data-early-observation-lost-2026-11-14).
+
 ## 2026-11-14: guarded recovery stopped before sleep at host address validation
 
 Local SIT 0.3.37.3 on `7.3.0-rc6-omamobile-gda171eae4cb7` reached a healthy

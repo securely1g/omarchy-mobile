@@ -4146,3 +4146,41 @@ IPv6. Fixtures cover initial ACK, quiescence, changed-IP reload, cleanup,
 restart and the actual daemon/host round trip with the kernel-style address.
 The same gated one-sleep/one-recovery-SETUP/two-reboot runbook applies only
 after a new signed build, offline gates and explicit owner approval.
+
+### M6 0.3.37.4: RTC wake and late healthy data, early observation lost (2026-11-14)
+
+Source `e3b71e1`, the unchanged gda171 kernel and corrected host validation
+passed awake acceptance: fresh matching internet CID 3, applied ACK 0 and
+awake lease on the pinned interface, IMS/SIM, both bound ICMP targets,
+HTTPS 200 and required smoke checks. No recovery attempt was spent.
+
+One ordinary systemd suspend request completed. The journal records entry
+at 06:42:37 UTC and exit at 06:43:21 UTC (about 44 seconds), RTC IRQ 109,
+success 1/fail 0 and completed post hooks. The SSH kernel stream used a
+15-second keepalive with count 2, which expired while the phone was frozen.
+The observer depended on that stream and missed the actual wake; its
+timeout was an instrumentation failure, not proof the phone failed to wake.
+
+The independent check at 06:50:25 UTC, about 424 seconds after resume,
+passed both bound ICMP targets and HTTPS 200. Fresh CID 3 matched its setup,
+ACK/lease were healthy, all four units and the SIM query worked. The
+controller remained generation 0, unspent and not uncertain. Logs contain
+only the two cold-start SETUP replies, with no recovery SETUP. No new
+serious kernel/storage error was found; known DME-set `0x4021` appeared once.
+
+**The planned measured test is incomplete.** The +60/+120-second readings
+were missed. No PDN loss was observed in the captured evidence, but the
+unobserved interval does not prove uninterrupted connectivity, and guarded
+recovery was not exercised. Do not promote this result to sleep qualification.
+
+The second approved reboot restored the exact original configuration,
+recovery and automatic sleep off, normal sleep guard active, NFC restored,
+watchdog 0 and no pending test alarm. Fresh data/IMS/SIM and required smoke
+passed; all six protected radio/calibration checksums remained unchanged.
+
+Future recording must tolerate the planned freeze (for example SSH
+`ServerAliveInterval=15`, `ServerAliveCountMax=10`) and obtain the actual
+resume timestamp from a fresh read-only journal query, rather than relying
+on a continuous stream. A new gated run can reuse the installed 0.3.37.4
+without package/image writes, but requires fresh approval for its reboot
+and sleep requests. Keep the once-per-boot recovery budget unchanged.
