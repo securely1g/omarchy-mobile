@@ -86,6 +86,21 @@ class RecoveryRoundTripTests(unittest.TestCase):
         self.assertFalse(self.fixture.controller.available)
         self.assertEqual(data_call.STATE.read_bytes(), self.fixture.state)
 
+    def test_real_roundtrip_preserves_kernel_link_local(self):
+        self.fake.link_local = dict(family='inet6', local='fe80::1', prefixlen=64,
+                                    scope='link', protocol='kernel_ll')
+        self.arm()
+        self.assertIn(self.fake.link_local, self.fake.addresses)
+        self.fixture.loss()
+        self.until(lambda: self.fixture.controller.state == 'setup')
+        self.assertEqual(self.fake.addresses, [self.fake.link_local])
+        self.until(lambda: self.fixture.controller.available)
+        self.assertEqual([a for a in self.fake.addresses if a['family'] == 'inet6'],
+                         [self.fake.link_local])
+        self.assertEqual([a['local'] for a in self.fake.addresses if a['family'] == 'inet'],
+                         ['192.0.2.11'])
+        self.assertEqual(len(self.fixture.setups()), 1)
+
     def test_failed_active_helper_enters_unavailable_without_modem_setup(self):
         self.arm()
         self.host.fail('host-operation')

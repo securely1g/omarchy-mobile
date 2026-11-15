@@ -77,6 +77,25 @@ def configuration(data):
     return str(addr), dns
 
 
+def preserved_link_local(address):
+    """Recognize the IPv6 link-local Linux can add when the link comes up.
+
+    It is not our configuration: never count it as an owned address or
+    remove it during IPv4 quiescence. Any other IPv6 configuration remains
+    a collision, including link-local addresses without kernel provenance.
+    """
+    protocols = [address[key] for key in ('protocol', 'proto') if key in address]
+    if address.get('family') != 'inet6' or address.get('scope') != 'link' \
+            or address.get('prefixlen') != 64 \
+            or not isinstance(address.get('local'), str) \
+            or not protocols or any(value != 'kernel_ll' for value in protocols):
+        return False
+    try:
+        return ipaddress.IPv6Address(address['local']).is_link_local
+    except ValueError:
+        return False
+
+
 def counters(stats):
     """(received bytes, sent packets) from `ip -j -s link` output for the device."""
     link = stats[0]['stats64']
@@ -513,7 +532,7 @@ class ManagedNetwork:
             if len(links) != 1 or links[0]['ifindex'] != self.binding['ifindex'] \
                     or 'UP' not in links[0]['flags']:
                 raise HostFailure('interface-changed')
-            addresses = links[0]['addr_info']
+            addresses = [a for a in links[0]['addr_info'] if not preserved_link_local(a)]
             if any(a.get('family') != 'inet' or a.get('local') != self.address
                    or a.get('prefixlen') != 32 for a in addresses):
                 raise HostFailure('host-conflict')

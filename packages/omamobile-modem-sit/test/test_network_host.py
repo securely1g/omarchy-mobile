@@ -16,7 +16,7 @@ from test_network_lifecycle import response
 
 class Network:
     """A netlink/ip/resolver fixture; never runs a process or opens a device."""
-    def __init__(self):
+    def __init__(self, link_local=False):
         self.up = False
         self.ifindex = 7
         self.addresses = []
@@ -29,6 +29,8 @@ class Network:
         self.on_proof = lambda: None
         self.blocked = False
         self.now = 100.0
+        self.link_local = (dict(family='inet6', local='fe80::1', prefixlen=64,
+                               scope='link', protocol='kernel_ll') if link_local else None)
 
     def run(self, *args):
         self.commands.append(args)
@@ -43,11 +45,16 @@ class Network:
             return b'[{"stats64":{"rx":{"bytes":100},"tx":{"packets":10}}}]'
         if args[:4] == ('ip', 'link', 'set', 'dev'):
             self.up = args[-1] == 'up'
+            if self.link_local:
+                if self.up and self.link_local not in self.addresses:
+                    self.addresses.append(dict(self.link_local))
+                elif not self.up:
+                    self.addresses = [a for a in self.addresses if a != self.link_local]
         elif args[:3] == ('ip', 'addr', 'add'):
             address = args[3].split('/')[0]
             if any(a['local'] == address for a in self.addresses):
                 raise RuntimeError('duplicate address')
-            self.addresses.append(dict(family='inet', local=address, prefixlen=32))
+            self.addresses.append(dict(family='inet', local=address, prefixlen=32, scope='global'))
         elif args[:3] == ('ip', 'addr', 'del'):
             address = args[3].split('/')[0]
             self.addresses = [a for a in self.addresses if a['local'] != address]
@@ -84,6 +91,8 @@ class Network:
 
 
 class HostTests(unittest.TestCase):
+    network_factory = Network
+
     def setUp(self):
         self.stack = ExitStack(); self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
@@ -91,7 +100,7 @@ class HostTests(unittest.TestCase):
             self.stack.enter_context(patch.object(protocol, name, self.root / name))
         self.stack.enter_context(patch.object(host, 'INTERFACE', self.root / 'interface'))
         self.stack.enter_context(patch.object(host.paths, 'RUN', self.root))
-        self.fake = Network()
+        self.fake = self.network_factory()
         self.stack.enter_context(patch.object(protocol, 'clock', lambda: self.fake.now))
         self.stack.enter_context(patch.object(host.time, 'monotonic', lambda: self.fake.now))
         self.stack.enter_context(patch.object(host, 'run', self.fake.run))
@@ -442,6 +451,78 @@ class HostTests(unittest.TestCase):
         text = self.output.getvalue()
         self.assertNotIn('192.0.2.', text)
         self.assertNotIn(response().hex(), text)
+
+
+class LinkLocalHostTests(unittest.TestCase):
+    """Linux may add link-local IPv6 as soon as discovery raises the link."""
+    network_factory = staticmethod(lambda: Network(link_local=True))
+    setUp = HostTests.setUp
+    quiesce = HostTests.quiesce
+    active = HostTests.active
+    owned_routes = HostTests.owned_routes
+
+    def test_link_local_survives_initial_apply_quiesce_changed_ip_reload_and_close(self):
+        local = dict(self.fake.link_local)
+        self.assertIn(local, self.fake.addresses)
+        self.assertEqual(protocol.read_ack()['phase'], 'applied')
+        self.quiesce()
+        self.assertEqual(self.fake.addresses, [local])
+        self.assertEqual(protocol.read_ack()['phase'], 'quiesced')
+        self.active(response(address=b'\xc0\x00\x02\x14'))
+        self.host.tick()
+        self.assertIn(local, self.fake.addresses)
+        self.assertEqual(protocol.read_ack()['phase'], 'applied')
+        self.host.close()
+        self.assertEqual(self.fake.addresses, [local])
+        self.assertFalse(self.owned_routes())
+        self.assertTrue(self.fake.up)
+        self.assertFalse(any(c[:3] == ('ip', 'addr', 'flush')
+                             or (c[:3] == ('ip', 'addr', 'del') and ':' in c[3])
+                             or (c[:4] == ('ip', 'link', 'set', 'dev') and c[-1] == 'down')
+                             for c in self.fake.commands))
+
+    def test_restart_cleanup_preserves_link_local_and_never_discovers_again(self):
+        other = host.ManagedNetwork(protocol.read_state())
+        with patch.object(host, 'find_device') as discover:
+            self.assertFalse(other.start())
+        discover.assert_not_called()
+        self.assertEqual(self.fake.addresses, [self.fake.link_local])
+        self.assertFalse(self.owned_routes())
+        self.assertEqual(len(self.fake.probes), 1)
+
+    def test_link_local_without_kernel_protocol_is_not_assumed_automatic(self):
+        local = next(a for a in self.fake.addresses if a['family'] == 'inet6')
+        del local['protocol']
+        self.fake.commands.clear()
+        with self.assertRaisesRegex(host.HostFailure, 'host-conflict'):
+            self.host.quiesce()
+        self.assertEqual(len(self.fake.addresses), 2)
+        self.assertFalse(any(c[:2] in (('ip', 'addr'), ('ip', 'route'))
+                             for c in self.fake.commands))
+
+    def test_link_local_accepts_explicit_proto_alias(self):
+        local = next(a for a in self.fake.addresses if a['family'] == 'inet6')
+        local['proto'] = local.pop('protocol')
+        self.assertTrue(self.host.inspect()[2])
+        self.quiesce()
+        self.assertEqual(self.fake.addresses, [local])
+        self.assertFalse(self.host.inspect()[2])
+
+    def test_other_ipv6_or_wrong_link_local_metadata_blocks_before_mutation(self):
+        for update in (dict(local='2001:db8::1', scope='global'),
+                       dict(local='fd00::1', scope='global'),
+                       dict(scope='global'), dict(prefixlen=128),
+                       dict(protocol='static'), dict(protocol=None), dict(proto='static')):
+            foreign = dict(self.fake.link_local, **update)
+            with self.subTest(update=update):
+                self.fake.addresses.append(foreign)
+                self.fake.commands.clear()
+                with self.assertRaisesRegex(host.HostFailure, 'host-conflict'):
+                    self.host.quiesce()
+                self.assertIn(foreign, self.fake.addresses)
+                self.assertFalse(any(c[:2] in (('ip', 'addr'), ('ip', 'route'))
+                                     or c[0] == 'resolvectl' for c in self.fake.commands))
+                self.fake.addresses.remove(foreign)
 
 
 class ProofTests(unittest.TestCase):
