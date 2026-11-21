@@ -510,6 +510,7 @@ class Recovery:
                     if _identity(found) != _identity(expected):
                         raise Unsafe('cid-changed')
                     self._dirty = False
+                    self._deadline = None
                     self.state, self.available = 'active', True
                     return
                 if self.spent:
