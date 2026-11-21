@@ -225,6 +225,21 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.setups(), [])
         self.assertEqual(lifecycle.read_state()['generation'], 0)
 
+    def test_present_bearer_remains_available_after_candidate_timeout(self):
+        self.arm(); self.controller.observe(listed(self.owner.items))
+        self.until('check-first'); self.until('active')
+        # The investigation finished without a missing bearer. A healthy
+        # helper lease must remain usable after that candidate's deadline,
+        # including while reports keep the modem transport nonquiet.
+        self.now += recovery.CANDIDATE_TIMEOUT + 1
+        self.tick(quiet=False)
+        self.assertEqual(self.controller.state, 'active')
+        self.assertTrue(self.controller.available)
+        self.assertEqual(self.setups(), [])
+        self.assertFalse(recovery.SPENT.exists())
+        self.assertEqual(lifecycle.read_state()['phase'], 'active')
+        self.assertEqual(lifecycle.read_state()['generation'], 0)
+
     def test_new_foreign_or_changed_ims_context_refuses_without_setup(self):
         self.arm(); self.loss(); self.owner.items[7] = item(7, 70)
         self.until('unavailable')
