@@ -134,6 +134,26 @@ class Reconnect(unittest.TestCase):
         self.assertEqual(calls[-1], ['systemctl', 'start', 'omamobile-sit-data.service'])
         self.assertIsNone(self.service.reconnect_at)
 
+    def test_guarded_recovery_is_the_only_bearer_controller(self):
+        self.service.recovery_requested = True
+        self.service.recovery = Mock()
+        payload = listing(item(2))
+        self.service.event(self.indication(payload))
+        self.service.recovery.observe.assert_called_once_with(payload)
+        self.assertIsNone(self.service.reconnect_at)
+        app_service.subprocess.run.assert_not_called()
+        # A stale plain reconnect timer cannot activate a second bearer.
+        self.service.reconnect_at = 0
+        with patch.object(data_call, 'activate') as activate:
+            self.service.reconnect()
+        activate.assert_not_called()
+
+    def test_guarded_startup_waits_for_the_owner(self):
+        self.service.recovery_requested = True
+        self.service.event(self.indication(listing(item(2))))
+        self.assertIsNone(self.service.reconnect_at)
+        app_service.subprocess.run.assert_not_called()
+
     def test_data_off_stays_off(self):
         app_service.subprocess.run.return_value.returncode = 3     # the route service stopped
         self.service.event(self.indication(listing(item(2))))

@@ -6,9 +6,12 @@ Starts on a CP that the modem unit (omamobile-modem.service) has brought
 ONLINE; --bringup registers it first (bringup.py). Then it serves calls, SMS
 and status on a Unix socket, /run/omamobile-sit/socket: one JSON request per
 line, one JSON reply per line. Root and members of [control] group may use
-it. No radio, NV, SIM or raw-request command is exposed.
+it. No NV, SIM-write or raw-request command is exposed.
 
   {"action": "status"}                      modem, calls, audio
+  {"action": "own-number"}                  private, read-only USIM number query
+  {"action": "bearer-status"}               private, read-only owned-bearer query
+  {"action": "recovery-status"}             private, cached recovery state only
   {"action": "dial", "number": "+1..."}     an IMS voice call
   {"action": "accept"|"hangup"|"delete-call", "id": "..."}
   {"action": "dtmf", "id": "...", "keys": "12#"}
@@ -68,12 +71,21 @@ RATS = {0: '', 1: 'GPRS', 2: 'EDGE', 3: 'UMTS', 9: 'HSDPA', 10: 'HSUPA', 11: 'HS
 SOCKET = paths.RUN / 'socket'
 # The panel's power, which the shell drives (bl_power 4 = off, 0 = on).
 BACKLIGHT = Path(os.environ.get('OMAMOBILE_SIT_BACKLIGHT', '/sys/class/backlight'))
+RECOVERY_GUARD_UNIT = 'omamobile-data-recovery-failsafe.service'
 # GET_RADIO_POWER / IND_RADIO_STATE_CHANGED (MODEM-SIT-RESEARCH 3.1):
 # INITIALIZED and STOP_NETWORK are off, START_NETWORK on, POWER_OFF is the
 # state without a SIM (M4.1i), RESET is unavailable. GET_RADIO_POWER answers
 # 10 with the radio on (cheetah and tegu, 2026-11-02): Android's RadioState
 # ON (OFF 0, UNAVAILABLE 1, ON 10).
 RADIO = {0: 'off', 1: 'off', 2: 'on', 3: 'off', 4: 'unavailable', 10: 'on'}
+
+
+def new_recovery_guard():
+    # PID1 creates this outside sitd's mount namespace/control group. /etc
+    # stays read-only under ProtectSystem=full; the guard lasts until reboot.
+    from data_recovery import SleepGuard
+    return SleepGuard(unit=RECOVERY_GUARD_UNIT,
+                      who='omamobile-data-recovery-failsafe', permanent=True)
 
 
 def lte_rsrp(payload):
@@ -319,6 +331,11 @@ class Service:
         self.reconnect_tries = 0
         self.reconnecting = False
         self.reconnect_data = False
+        self.recovery = None
+        self.recovery_guarded = False
+        self.recovery_requested = False
+        self.recovery_fail_guard = None
+        self.recovery_guard_deadline = None
         self.sim = dict(state='unknown')
         self.radio = 'unknown'
         self.current_stage = 'starting'
@@ -457,15 +474,21 @@ class Service:
             # IND_RADIO_STATE_CHANGED: u32 at 0x08. Re-read the network too.
             if len(packet) >= 12:
                 self.radio = RADIO.get(struct.unpack_from('<I', packet, 8)[0], 'unknown')
+                if self.recovery is not None and self.radio != 'on':
+                    self.recovery.invalidate()
             self.next_poll = 0
             self.publish()
         elif ident == 0x0804:
             # IND_PHONE_RESET: the CP asks for a reset (after a carrier
             # profile changed its NV, among stock's reasons). Logged only;
             # nothing resets the CP in place.
+            if self.recovery is not None:
+                self.recovery.invalidate()
             print(reset_indication(packet), flush=True)
         elif ident == 0x0210:
             # IND_SIM_STATUS_CHANGED carries nothing we read: poll again.
+            if self.recovery is not None:
+                self.recovery.invalidate()
             self.next_poll = 0
         elif ident == 0x0906:
             # IND_SIGNAL_STRENGTH, every second or two: publish on a change only.
@@ -491,6 +514,13 @@ class Service:
                 print(data_call_change(self.data_call_list), flush=True)
             except Exception as error:   # a log line must never stop sitd
                 print('Data-call list changed: not described:', type(error).__name__, flush=True)
+            # An explicitly requested guarded recovery owns this bearer, including
+            # the interval before it is armed and any terminal failure.
+            if self.recovery_requested:
+                if self.recovery is not None:
+                    self.recovery.observe(self.data_call_list)
+                    self.publish()
+                return
             if internet_dropped(self.data_call_list) and self.internet_setup \
                     and self.current_stage == 'running' and not self.reconnecting and self.reconnect_at is None:
                 # The network or the modem ended the internet bearer; nothing
@@ -579,6 +609,8 @@ class Service:
         doubling to 5 minutes, and every 30 minutes after the twelfth. A try
         holds sitd's loop (up to about two minutes: settle, registration,
         setup), so none starts while a call is live."""
+        if self.recovery_requested:
+            return
         if self.reconnect_at is None or time.monotonic() < self.reconnect_at or not self.internet_setup:
             return
         if self.radio == 'off':
@@ -682,6 +714,48 @@ class Service:
             self.release_unconfirmed = True
             unconfirmed_release(self.client, 'hangup deadline expired')
 
+    def protect_recovery(self, *, force=False, wait=False):
+        """Hold an independent reboot-lifetime guard on recovery failure.
+
+        The independent temporary unit normally protects an in-flight SETUP.
+        A stale spent marker, helper failure or lost guard must also fail
+        closed. Never write /etc or stop/restart the modem/SIT units here.
+        Normal ticks only poll; unexpected-exit cleanup waits at most 3s.
+        """
+        recovery = self.recovery
+        if self.recovery_guarded:
+            return
+        needed = force and self.recovery_requested
+        if recovery is not None and recovery.enabled:
+            needed |= recovery.uncertain or (recovery.state == 'unavailable'
+                                             and recovery.reason != 'owner-stopped')
+            if recovery.guard_held:
+                return
+        if not needed:
+            return
+        if self.recovery_guard_deadline is None:
+            self.recovery_guard_deadline = time.monotonic() + 3
+        if self.recovery_fail_guard is None:
+            self.recovery_fail_guard = new_recovery_guard()
+        while True:
+            if self.recovery_fail_guard.ready():
+                self.recovery_guarded = True
+                return
+            if time.monotonic() >= self.recovery_guard_deadline:
+                raise RuntimeError('Recovery sleep guard unavailable')
+            if not wait:
+                return
+            time.sleep(.02)
+
+    def advance_recovery(self, quiet):
+        if self.recovery is None:
+            return
+        before = self.recovery.available
+        self.recovery.tick(quiet=quiet)
+        self.protect_recovery()
+        if self.recovery.available != before:
+            self.publish()
+
     def send_sms(self, request):
         key = request.get('request_id', '')
         if not isinstance(key, str) or len(key) != 32 or any(c not in '0123456789abcdef' for c in key):
@@ -735,7 +809,8 @@ class Service:
         reg = self.registration()
         voice = reg.get('state') == 2 and reg.get('features', 0) & 1 != 0
         sms = reg.get('state') == 2 and reg.get('features', 0) & 2 != 0
-        data = bearer_paths(data_call.INTERNET_CID)[0].exists()
+        data = (self.recovery.available if self.recovery is not None and self.recovery.enabled
+                else bearer_paths(data_call.INTERNET_CID)[0].exists())
         modem = dict(present=True, stage=self.current_stage, ready=voice,
                      state='registered' if self.net['reg'] in ('home', 'roaming') else 'searching',
                      registration=self.net['reg'], tech=self.net['rat'],
@@ -888,13 +963,47 @@ class Service:
                 raise ValueError('Radio state must be boolean')
             if not on and self.live():
                 raise RuntimeError('Call in progress')
+            if self.recovery is not None:
+                self.recovery.invalidate()
             radio(on)
             self.next_poll = 0
             return dict(radio='on' if on else 'off')
         if action == 'power-status':
             return dict(screen_on=self.screen_on, indications=dict(self.indication_counts))
+        if action == 'recovery-status':
+            if set(request) != {'action'}:
+                raise ValueError('The recovery status query takes no arguments')
+            recovery = self.recovery
+            if recovery is None:
+                return dict(enabled=False, state='disabled', available=False)
+            return dict(enabled=recovery.enabled, state=recovery.state,
+                        reason=recovery.reason, available=recovery.available,
+                        spent=recovery.spent, uncertain=recovery.uncertain,
+                        guard_held=self.recovery_guarded or recovery.guard_held,
+                        generation=recovery.generation)
         if action == 'status':
             return self.status()
+        if action == 'own-number':
+            # Explicit, private, read-only: do not cache this result in
+            # status(), state.json, subscriptions, the database or a log.
+            if set(request) != {'action'}:
+                raise ValueError('The SIM number query takes no arguments')
+            if self.live():
+                raise RuntimeError('End the current call before reading the SIM number')
+            from msisdn import read_numbers
+            result = read_numbers(self.client)
+            self.pump()
+            return result
+        if action == 'bearer-status':
+            # On demand only; never add this comparison to published state.
+            if set(request) != {'action'}:
+                raise ValueError('The bearer status query takes no arguments')
+            if self.live():
+                raise RuntimeError('End the current call before reading bearer status')
+            from bearer_status import read_status
+            result = read_status(self.client, inventory=True)
+            self.pump()
+            return result
         if action == 'sms-list':
             return [dict(id='sit:'+r['id'], number=r['number'], text=r['text'], timestamp=r['timestamp'],
                          data=r['data'], state='received')
@@ -1121,9 +1230,11 @@ def main():
         raise SystemExit('CP is not ONLINE: start omamobile-modem.service first')
     if args.probe:
         return probe()
+    recover_enabled = args.bringup and settings['control'].getboolean('recover_data', False)
     client = Sit(allow_sms=True, allow_calls=True,
                  allow_manifest=bool(settings['network'].get('carrier_manifest', '').strip()),
-                 allow_isim_pcscf=settings['network'].getboolean('ims_pcscf_from_isim', True))
+                 allow_isim_pcscf=settings['network'].getboolean('ims_pcscf_from_isim', True),
+                 allow_msisdn=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     service = None
     stopping = False
@@ -1138,12 +1249,17 @@ def main():
         if marker.exists() and json.loads(marker.read_text()):
             unconfirmed_release(client, 'a call from the previous service run was never released')
         service = Service(client, database(paths.STATE / 'apps.db'), settings)
+        service.recovery_requested = bool(recover_enabled)
         service.publish()
         for sms in paths.INBOX.glob('*.sit'):
             service.ingest(sms)
         if args.bringup:
             from bringup import start
             start(service, settings, lambda: stopping)
+            if recover_enabled:
+                from data_recovery import Recovery
+                service.recovery = Recovery(service, enabled=True)
+                service.recovery.arm()
         service.stage('running')
         SOCKET.unlink(missing_ok=True)
         server.bind(str(SOCKET))
@@ -1189,9 +1305,16 @@ def main():
             try:
                 connection, _ = server.accept()
             except socket.timeout:
-                continue
-            if not serve_one(service, connection, clients):
-                connection.close()
+                connection = None
+            if connection is not None:
+                if not serve_one(service, connection, clients):
+                    connection.close()
+            if service.recovery is not None:
+                # Queue fresh bytes, then process calls/SMS before recovery.
+                # No event callback runs reentrantly in a transport wait.
+                quiet = client.drain_ready()
+                service.pump()
+                service.advance_recovery(quiet)
             service.broadcast()
     finally:
         try:
@@ -1215,13 +1338,21 @@ def main():
                 if service:
                     service.audio_stop()
             finally:
-                if service:
-                    for connection in list(service.subscribers):
-                        service.drop(connection)
-                client.close()
-                server.close()
-                SOCKET.unlink(missing_ok=True)
-                (paths.RUN / 'state.json').unlink(missing_ok=True)
+                try:
+                    try:
+                        if service and service.recovery is not None:
+                            service.recovery.close()
+                    finally:
+                        if service:
+                            service.protect_recovery(force=not stopping, wait=True)
+                finally:
+                    if service:
+                        for connection in list(service.subscribers):
+                            service.drop(connection)
+                    client.close()
+                    server.close()
+                    SOCKET.unlink(missing_ok=True)
+                    (paths.RUN / 'state.json').unlink(missing_ok=True)
 
 
 if __name__ == '__main__':

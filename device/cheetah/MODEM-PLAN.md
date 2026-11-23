@@ -3516,6 +3516,82 @@ of the cacheable regions; no CPU mapping of AoC voice SRAM; no `remove()`
 for cpif; panics turned into errors.
 
 
+## Read-only SIM number query (0.3.37, 2026-11-14)
+
+`omamobile-sit own-number [--json]` asks the existing daemon to read
+EF_MSISDN (6F40) from the ready USIM. The daemon remains the only IPC0
+owner. This is an explicit private socket action, not an automatic
+startup or status query: no number is cached in status, subscriptions,
+the database, the public state file or logs. The ModemManager bridge's
+`OwnNumbers` policy is unchanged.
+
+The separate `allow_msisdn` owner flag grants only GET RESPONSE and
+absolute READ RECORD on that file, under the USIM ADF, with no PIN2 or
+write data. Record sizes, counts and total time are bounded. The first
+version does not read extension files: an extension-dependent number
+is reported incomplete rather than silently truncated. A missing or
+unreadable file is unavailable, distinct from a successfully read file
+with empty records. A SIM-stored number is not proof of the current
+carrier-assigned number.
+
+The synchronous query can delay processing incoming indications for up to
+15 seconds. Active calls are refused; incoming-call latency during a slow
+SIM response has not been qualified. Use the command while the phone is
+idle.
+
+Gated runbook (no kernel or boot-image changes):
+
+1. **Offline, no hardware risk:** run
+   `packages/omamobile-modem-sit/test/all` and `git diff --check`, then
+   build the package. Expect the SIM parser, byte-by-byte transport
+   restrictions, authorized socket action, CLI and privacy tests to
+   pass. Stop on any failure. Rollback: discard the local feature files.
+2. **Install, low risk:** preserve the installed package and private
+   configuration. Build and upgrade to 0.3.37 through the project's
+   package tooling. Expect 0.3.37 and the existing sitd PID unchanged.
+   Stop if an unrelated dependency or service change is required. Do not
+   remove the package or restart sitd on a running CP. Rollback: install
+   the saved previous package, leaving the running daemon alone.
+3. **Activate, attended reboot:** check NV backups and charging; inspect
+   the modem's existing markers and ensure no live call. Ask the owner
+   before the reboot (AGENTS section 1). Use a clean systemd reboot so
+   the modem's stop hook clears its online marker. Expect the same
+   kernel, then modem ONLINE and sitd running. Stop on lost SSH beyond
+   three minutes, CP crash, or storage errors; do not retry the profile
+   in the same boot. Rollback: the saved package and another approved
+   clean reboot.
+4. **Query, bounded read-only:** with no live call, run
+   `omamobile-sit own-number --json` once. Expect `source: sim` and one
+   of available, empty, unavailable or incomplete. Return a number only
+   for available; do not publish the number or raw SIM data in this
+   runbook. Stop on any timeout, parser refusal, modem state change or
+   unexpected kernel error. Verify voice/SMS registration and data
+   remain as before. No SIM write or retry with arbitrary APDUs is a
+   recovery action.
+
+**Results, 2026-11-14:** kernel
+`7.3.0-rc6-omamobile-g1a9d1d4e9289`, local
+`omamobile-modem-sit` 0.3.31.1-1. The installed 0.3.31 baseline matched
+the source files before patching. Thirty-nine targeted parser, guard,
+private socket and CLI tests passed, as did the full package suite with
+the RIL simulator, the native aarch64 build and an independent source
+review. The original package was rebuilt and kept for rollback. The
+upgrade preserved the running daemon PID and the private configuration.
+
+After the owner's approved clean reboot
+(`systemctl reboot --reboot-argument=omamobile`), the same kernel booted,
+the modem came ONLINE and registration completed. One explicit query
+returned `available`, `source: sim`, with one number; the value is not
+recorded here. The number was absent from public state and the daemon
+journal. The modem, sitd, cellular-data service and ModemManager bridge
+remained active; the SIM was ready, LTE registered at home, and IMS
+voice/SMS and data remained available. No current-boot UFS error-handler
+pass, I/O error, oops, failed BME access or watchdog-stop error was found.
+The temporary runtime watchdog was restored to its previous setting.
+The query code tested in that local build is carried into 0.3.37 on the
+current main branch; that rebased package has not been installed on the
+phone. Other devices and incoming calls during a query were not tested.
+
 ## 7. M6: suspend with the modem online (plan and first runs, 2026-11-09)
 
 Status (2026-11-14): **Done on the 7 Pro.** M6.2, the refusal on purpose
@@ -3875,3 +3951,407 @@ panel goes dark; then M6.4 (20 sleeps through the shell's auto-sleep, the
 modem registered and a ping over `rmnet` after each, no UFS line) and M6.5
 (a day of use with the modem up). Then DEVICES' Suspend cell moves to
 "works".
+
+### M6 stopped after cellular data failed following the second sleep (2026-11-14, America/Los_Angeles)
+
+An additional Pixel 7 Pro (cheetah), attended and on USB power, ran kernel
+`7.3.0-rc6-omamobile-gda171eae4cb7` (merged [linux-omarchy-mobile#232](https://github.com/derekross/linux-omarchy-mobile/pull/232)).
+Packages: `linux-omamobile` 7.3.0rc6.r830.gda171eae4cb7-1,
+`omamobile-modem-sit` 0.3.37.1-1, `omamobile-modem` 0.1.25.1-1 and
+`omamobile-device-cheetah` 0.1.56.1-1. Omarchy and the shell were unchanged.
+
+Three awake boots passed the required smoke checks, live cellular IPv4
+ping 3/3, IMS voice/SMS registration and the private SIM-number query
+(`available`, one number; value omitted). With `follow_screen` enabled,
+screen-off/on requests were acknowledged and optional `0906` indication
+counts stayed flat while dark.
+
+Two RTC sleeps ran through normal `systemctl suspend`, with hooks and
+inhibitors respected. The first woke on IRQ 109 and data passed 3/3.
+The second request was initially refused with -EBUSY before the freeze,
+then slept and woke on the RTC: cumulative success 2, fail 1. Afterward,
+cellular ping received 0/3 replies, while the live SIM query still answered.
+
+The route monitor observed TX without RX and failed probes, then removed
+the metric-700 default. Read-only checks found the interface up, its IPv4
+configuration matching the bearer record, and an explicitly bound route
+lookup succeeding. Indication counts `0804` and `074a` were zero, without
+a pre-test snapshot. The cause remains undetermined.
+
+No D3cold-to-D0 failure, BME failure, UFS error-handler, I/O error or oops was found. The known
+s2idle DME-set `0x4021` messages appeared in both cycles.
+
+**Sleep qualification failed.** Testing stopped: opt-in removed, inhibitor
+active, original configuration restored, auto-sleep off, NFC and runtime
+watchdog (0) restored. A separately approved clean recovery reboot kept the installed r830 images,
+with suspend inhibited and the original configuration restored. Cellular
+IPv4 ping recovered (3/3), IMS registered, the private SIM query returned
+one stored number, required smoke checks passed with no new kernel errors, and
+all six protected radio/calibration partition checksums remained the same.
+Call/SMS wake, busy-refusal stress and power benchmarks were not run.
+
+### M6 cellular route recovery candidate (2026-11-14, not hardware-qualified)
+
+The failed run above also exposed two reproducible route-watch defects:
+returning from SleepHold reused the pre-sleep traffic baseline/deadline,
+and a route withdrawn behind Wi-Fi was never checked again in that boot.
+The local `omamobile-modem-sit` 0.3.37.2 candidate starts a fresh 30-second
+interval after restoring the route and allows three probes of the same
+owned interface, with retry gaps of 30, 60 and 120 seconds (approximately
+30, 90 and 210 seconds after withdrawal). A successful probe restores
+only the existing metric-700 fallback; no bearer setup, interface search,
+radio toggle or modem restart is attempted. Sleep and roaming still gate
+the rechecks. A subprocess failure consumes its probe attempt.
+
+These are userspace recovery fixes, not evidence that the packet stall is
+fixed: the saved bound ping failed about 113 seconds after the earlier
+wake. Keep kernel `7.3.0-rc6-omamobile-gda171eae4cb7` unchanged for this
+comparison. The private action `bearer-status` requests a fresh
+GET_DATA_CALL_LIST through sitd's existing owner and returns only numeric
+bearer state and address-presence/match booleans. It never changes a bearer
+or publishes addresses, APNs, DNS or raw payloads.
+
+Offline validation: 37 route-watch tests, 60 focused bearer/SIM/service
+tests and the full SIT package suite (including sit-sim) pass. Independent
+source review found no blocking issue. The hardware retest below failed.
+
+Gated attended retest, automatic sleep off and powered USB connected:
+
+1. **Low risk, read-only:** verify all six NV checksums, charging, empty RTC
+   alarm, `[s2idle]`, UFS `spm_lvl` 5, each cellular service and the saved
+   rollback packages/configuration. Capture routes, interface counters and
+   source-audited `pktproc/status`/`pktproc_ul/status` decimal counters;
+   then bounded interface-bound ICMP and DNS-independent HTTPS. Stop if the
+   awake baseline or backup check fails. Rollback: no change was made.
+2. **Medium risk, new owner approval:** install only the signed reviewed
+   SIT package, preserve the existing carrier/audio configuration, enable
+   the previously tested `follow_screen` and modem-suspend opt-in, and take
+   one clean `systemctl reboot --reboot-argument=omamobile`. No kernel,
+   device package or boot-image write is part of this candidate. Start the
+   laptop log stream first. Pass: exact package/source hashes, same kernel,
+   fresh IMS registration, zero live calls, live SIM query and both data
+   probes work. Stop for any regression; do not restart the modem or sitd.
+3. **High risk, attended:** use the M6 RTC procedure for two separate
+   45-second `rtcwake -m no` alarms and normal
+   `systemctl --no-ask-password suspend`, without force or inhibitor bypass.
+   Announce screen changes first; keep the established runtime watchdog
+   and owner recovery buttons available. Require a real successful sleep,
+   its wake reason and completed systemd hooks. Before each sleep and at
+   wake/10/60/120 seconds, capture passive routes/counters first, then the
+   fresh private bearer query, then bound ICMP/HTTPS. A control query wakes
+   the link, so preserve that ordering and timestamps. Queue counters are
+   shared by bearers and alone do not prove internet delivery.
+4. **Stop/rollback:** no second sleep after lost data, registration, SIM
+   access or a new serious kernel error. Remove the opt-in, start the modem
+   sleep inhibitor, restore the saved configuration, NFC and runtime
+   watchdog; leave auto-sleep off. The approved sequence must include a
+   final clean reboot into this guarded configuration, on pass or failure,
+   followed by fresh data/IMS/SIM, smoke and NV checks. This is the second
+   reboot, or early recovery if testing stops. Further reboots and package
+   downgrades require separate approval. Never use a warm modem
+   restart, manual bearer recreation or route edits to turn a failed test
+   into a pass. If no wake after two minutes, stop probing and ask the owner
+   to recover with the buttons. Record actual outcomes before extending to
+   calls/SMS or power measurements.
+
+### M6 route-recovery retest: owned internet bearer disappeared (2026-11-14)
+
+The attended retest used SIT 0.3.37.2-1 (source `ed0f4b3`) and the same
+`7.3.0-rc6-omamobile-gda171eae4cb7` kernel, modem and device packages.
+Only SIT was installed; no boot images were written. Awake acceptance
+passed: required smoke checks, all four cellular units, fresh IMS and SIM
+query, active CID 3 matching its saved setup, both bound ICMP targets and
+DNS-independent HTTPS (200).
+
+One RTC alarm was armed for 45 seconds. Normal systemd suspend actually
+slept about four seconds, then woke early on IRQ 160 (`cp2ap_wakeup`):
+success 1, fail 0. The first passive post-wake sample was about 24 seconds
+after resume; no immediate/+10-second observation is claimed. Some traffic
+arrived between the pre-sleep and first post-wake snapshots (RX packets
+21 to 40).
+
+At that first check a fresh GET_DATA_CALL_LIST succeeded but omitted owned
+internet CID 3. Its response contained one bearer, compared with two in
+the awake baseline; the remaining bearer's identity was not exposed by
+this diagnostic. Both bound ICMP targets and HTTPS then failed while the
+metric-700 route was still present. During those probes TX increased five
+packets and RX stayed flat; the uplink queue consumed its descriptors and
+downlink queues had no pending drain backlog. The monitor withdrew the
+route later. This is not proof of a kernel queue defect.
+
+Packet registration remained accepted. The poll reported RAT 14 (LTE) to
+20 (LTE-CA) around the loss, then back to 14; that correlation does not
+explain the withdrawal. No runtime radio-off, deactivation request, daemon
+exit or new serious kernel/storage error was found. The known DME-set
+`0x4021` message appeared once.
+
+**Qualification failed; cycle 2 was skipped.** The guard and exact original
+configuration were restored immediately after failure, then the second
+approved clean reboot recovered the internet bearer. Both ICMP targets,
+HTTPS, fresh IMS/SIM query, all four units and required smoke checks passed;
+all six protected radio/calibration checksums remained unchanged. NFC was
+restored, watchdog returned to 0, the test RTC alarm was empty, automatic
+sleep remained off and the modem sleep inhibitor was active.
+
+The route-monitor fixes do not repair a withdrawn modem bearer. Runtime
+`0604` currently only updates a cache; ownership-file existence still
+advertises data and the host helper retains its startup configuration.
+Next work needs separately reviewed owned-bearer reconciliation, preserving
+the reservation and accounting for all other contexts before any recovery
+SETUP. No blind bearer recreation or further phone write is authorized by
+the completed two-reboot test sequence.
+
+### M6 guarded same-CID recovery candidate (0.3.37.3, not hardware-qualified)
+
+The next local candidate adds `[control] recover_data = no`, an experimental
+opt-in, independent of screen following and modem suspend. It captures the
+successful original internet SETUP privately in RAM, bound to the existing
+IPC owner and modern session 0. Ownership remains reserved when the bearer
+is absent; no file is deleted to bypass `activate()`.
+
+With the opt-in, sitd captures a fresh all-CID baseline. A `0604` change
+only schedules reconciliation. Recovery requires stable accepted packet
+registration, two fresh absent-target lists, unchanged known foreign/IMS
+contexts, no call or conflicting event, unchanged configuration and a fresh
+awake host lease. LTE and LTE-CA representation changes do not rewrite the
+original SETUP request. Unknown or newly numbered contexts refuse recovery.
+
+The host acknowledges quiescence after removing only its owned route,
+address and DNS contribution. It keeps the original interface name/ifindex;
+reload never searches other rmnet devices. Only then may sitd send one
+same-CID SETUP, with its once-per-boot budget recorded before transmission.
+There is no ALLOW_DATA, DEACTIVATE, radio, NR, attach/profile, IMS or modem
+restart in this transaction. Requests are asynchronous on the same owner;
+ordinary call/SMS/socket requests retain their own reply tokens.
+
+A validated reply and fresh confirming list precede atomic publication of
+the new configuration. The host must apply it on the pinned interface and
+pass bound ICMP and TCP checks before restoring metric 700 and acknowledging
+availability. IP/DNS changes are supported without touching other contexts.
+The private host ledger supports proven cleanup after helper failure;
+ambiguous ownership never permits rediscovery or another SETUP.
+
+An independent PID1 unit holds a strong sleep inhibitor during recovery.
+Uncertain outcomes retain it until reboot. A separate permanent failsafe
+also covers helper failure or unexpected daemon exit, including before the
+coordinator arms. It works with sitd's existing read-only `/etc` sandbox;
+hardening is unchanged. No guard path restarts the modem/SIT or writes `/etc`.
+Cached private `recovery-status` returns only fixed states/flags, and the
+private bearer diagnostic includes redacted per-CID state/presence flags.
+Neither action publishes addresses or raw replies.
+
+Offline gates include transport interleaving with real service call-accept
+and SMS-ACK handling, actual daemon/host generation round trips, changed
+IP/DNS, foreign conflicts, helper restarts, failed quiescence/proof, loss of
+guards/leases, cancellation, spent-budget uncertainty and privacy. Independent
+source review passed. The full SIT/simulator/package gates remain required
+before installation; offline success does not qualify modem-online sleep.
+
+Gated attended run, **fresh approval required**:
+
+1. **Low risk, read-only:** repeat the established NV, charging, RTC, s2idle,
+   storage, guard, live-data/IMS/SIM and smoke preflight. Verify the signed
+   package, exact source hashes and rollback. Stop on a failed prerequisite;
+   rollback is no change to the working phone.
+2. **Medium risk:** install only SIT 0.3.37.3, save the exact original private
+   config, enable the two reviewed control opt-ins and modem-suspend marker,
+   then take approved clean reboot 1. No kernel/device package or image write.
+   Require fresh awake data and coordinator availability with initial host
+   ACK 0, known inventory and pinned interface before attempting sleep.
+3. **High risk:** one attended RTC alarm for 45 seconds and normal systemd
+   suspend, with its hooks/inhibitors, the established watchdog and laptop
+   logs. Announce NFC/screen changes. After actual wake, use passive counters
+   and cached recovery state first; allow at most one explicitly approved
+   daemon-owned SETUP, not external/manual retries. Observe no longer than
+   180 seconds. Once available, independently verify fresh bearer state and
+   both bound ICMP/HTTPS; preserve actual timings and every temporary loss.
+   A lost/uncertain state or new serious error stops the test. No second sleep.
+4. **Mandatory teardown:** restore the exact original config, remove the
+   suspend marker, establish the normal modem inhibitor and restore NFC;
+   use approved clean reboot 2 on success or early failure. Verify fresh
+   data/IMS/SIM, required smoke and all six NV checksums, watchdog 0, no test
+   RTC alarm and automatic sleep off. A third reboot or package rollback
+   requires another explicit approval. If no wake within two minutes, stop
+   commands and use owner recovery. No warm restart or forced suspend.
+
+The first run can only establish a bounded recovery regression result.
+One-attempt-per-boot protection, early wakes, call/SMS wake, repeated sleep
+reliability and power consumption remain separate qualification work.
+
+### M6 recovery 0.3.37.3 stopped at awake host validation (2026-11-14)
+
+An attended activation of source `b0e59ce`, with the same gda171 kernel,
+reached IMS registration and a successful fresh all-CID baseline. The host
+found CID 3 on rmnet2 with bound ICMP/TCP proof, then rejected its address
+list before initial ACK 0. The traceback points to `ManagedNetwork.inspect`
+and its strict address predicate. The helper stopped; the controller
+reported unavailable, unspent and not uncertain, and its independent
+permanent sleep-block guard was verified held.
+
+No RTC request, actual sleep or recovery SETUP was performed. Logs show
+only the two ordinary cold-start SETUP replies. The exact original config
+and normal sleep guard were restored, then the second approved clean reboot
+recovered data. Fresh ICMP/HTTPS, IMS/SIM, all four units and required smoke
+passed; all six NV checksums were unchanged. Recovery is disabled, automatic
+sleep off, NFC restored, watchdog 0 and RTC empty.
+
+The guarded boot's address metadata shows the owned IPv4 /32 plus Linux's
+automatic IPv6 link-local: `inet6`, link scope, /64, protocol `kernel_ll`.
+That shape reproduces the validator rejection offline. The failed boot's
+full address list was not captured, so the saved traceback and this later
+address observation remain distinct evidence.
+
+Local candidate 0.3.37.4 narrowly preserves explicitly kernel-generated
+link-local IPv6 while counting/altering only its owned IPv4. It requires
+the family, link scope, /64, actual link-local value and explicit matching
+`kernel_ll` provenance. Missing/conflicting provenance, global/ULA IPv6,
+extra IPv4 and foreign routes still refuse. Nothing flushes or disables
+IPv6. Fixtures cover initial ACK, quiescence, changed-IP reload, cleanup,
+restart and the actual daemon/host round trip with the kernel-style address.
+The same gated one-sleep/one-recovery-SETUP/two-reboot runbook applies only
+after a new signed build, offline gates and explicit owner approval.
+
+### M6 0.3.37.4: RTC wake and late healthy data, early observation lost (2026-11-14)
+
+Source `e3b71e1`, the unchanged gda171 kernel and corrected host validation
+passed awake acceptance: fresh matching internet CID 3, applied ACK 0 and
+awake lease on the pinned interface, IMS/SIM, both bound ICMP targets,
+HTTPS 200 and required smoke checks. No recovery attempt was spent.
+
+One ordinary systemd suspend request completed. The journal records entry
+at 06:42:37 UTC and exit at 06:43:21 UTC (about 44 seconds), RTC IRQ 109,
+success 1/fail 0 and completed post hooks. The SSH kernel stream used a
+15-second keepalive with count 2, which expired while the phone was frozen.
+The observer depended on that stream and missed the actual wake; its
+timeout was an instrumentation failure, not proof the phone failed to wake.
+
+The independent check at 06:50:25 UTC, about 424 seconds after resume,
+passed both bound ICMP targets and HTTPS 200. Fresh CID 3 matched its setup,
+ACK/lease were healthy, all four units and the SIM query worked. The
+controller remained generation 0, unspent and not uncertain. Logs contain
+only the two cold-start SETUP replies, with no recovery SETUP. No new
+serious kernel/storage error was found; known DME-set `0x4021` appeared once.
+
+**The planned measured test is incomplete.** The +60/+120-second readings
+were missed. No PDN loss was observed in the captured evidence, but the
+unobserved interval does not prove uninterrupted connectivity, and guarded
+recovery was not exercised. Do not promote this result to sleep qualification.
+
+The second approved reboot restored the exact original configuration,
+recovery and automatic sleep off, normal sleep guard active, NFC restored,
+watchdog 0 and no pending test alarm. Fresh data/IMS/SIM and required smoke
+passed; all six protected radio/calibration checksums remained unchanged.
+
+Future recording must tolerate the planned freeze (for example SSH
+`ServerAliveInterval=15`, `ServerAliveCountMax=10`) and obtain the actual
+resume timestamp from a fresh read-only journal query, rather than relying
+on a continuous stream. A new gated run can reuse the installed 0.3.37.4
+without package/image writes, but requires fresh approval for its reboot
+and sleep requests. Keep the once-per-boot recovery budget unchanged.
+
+### M6 measured repeat on installed 0.3.37.4: gated runbook (2026-11-14)
+
+This repeat was prepared offline; its subsequent approved result is recorded
+below. Reuse the installed package and gda171 kernel. No package or image
+write is needed.
+The recorder waits until request +55 seconds, then reads the actual resume
+timestamp from a fresh journal query and verifies exactly one new suspend
+success with no new failure. It checks that resume, counters, uptime and
+interface remain consistent throughout observation. It makes no T0/+10
+measurement claim. A local monotonic deadline bounds observation to actual
+resume +180 seconds; remote TERM/KILL timeouts also bound each command.
+
+Fresh bearer reads and packet checks target resume +60/+120 seconds. Cached
+recovery state must be settled before the fresh GET, after it, before each
+probe and after all probes. A pending state permits cached observation only;
+partial packet failures remain failures. A missing or more than five-second
+late target remains incomplete. Active samples leave at least 30 seconds
+after completion before another starts. Offline fixtures cover normal and
+early wake, pending-state races, failed partial probes, changed sleep/reset
+context, command deadlines and missed measurements. These are recorder
+checks, not additional hardware results.
+
+Fresh approval must name this complete sequence:
+
+1. **Low risk, read-only:** repeat NV, power, temperature, UTC agreement,
+   RTC, s2idle, UFS, inhibitor, live data/IMS/SIM and smoke preflight. Pin
+   reviewed recorder hashes and current installed source. Stop for any
+   mismatch; this step changes no phone state.
+2. **Medium risk:** save the exact private original configuration, enable
+   the two reviewed control settings and suspend marker, then clean reboot
+   1 of 2. Require healthy generation 0/unspent availability, applied ACK
+   and fresh awake lease before any sleep. Keep automatic sleep off.
+3. **High risk:** up to two separately reviewed, attended 45-second RTC
+   requests on powered USB, through normal systemd hooks and inhibitors.
+   Announce NFC/screen changes and use the established watchdog and logs.
+   Cycle 2 requires a complete timely measured first pass, expected RTC
+   sleep, healthy data/control/IMS/SIM and kernel, generation 0, no pending
+   recovery and no spent attempt. Any recovery SETUP, refusal, unexpected
+   early wake, missing measurement or failure ends further sleep testing.
+   At most one explicitly approved daemon-owned same-CID SETUP is allowed
+   in the entire boot, using its original parameters and existing guards.
+   No manual SETUP, warm restart, forced suspend or replacement request.
+4. **Mandatory teardown:** on pass or stop, restore the exact original
+   configuration and normal sleep inhibitor, remove the test marker,
+   restore NFC and clear only the owned RTC alarm. Use reserved clean
+   reboot 2, then verify data/IMS/SIM, smoke, all six NV checksums, recovery
+   off, automatic sleep off, watchdog 0 and no pending alarm. A third reboot
+   requires new approval. If wake/reconnection is unverified by two minutes,
+   cease automated phone commands and involve the owner.
+
+The second request has its own evidence gate; this is not an automatic loop.
+Even two successful short sleeps would establish only the measured cases.
+Recovery remains unexercised unless an actual lost bearer triggers SETUP;
+general sleep reliability and power savings still require separate evidence.
+
+### M6 measured retest: data healthy, recovery unexercised (2026-11-15)
+
+The approved sequence reused installed SIT 0.3.37.4, source `e3b71e1`, and
+`7.3.0-rc6-omamobile-gda171eae4cb7`. It used two clean reboots and two
+separately gated sleep requests, with no package or image write. Awake
+acceptance verified all 25 installed Python/launcher hashes, applied ACK 0,
+fresh awake lease, pinned interface, data, IMS/SIM and required smoke checks.
+
+| Cycle | Actual sleep / wake | Independent data checks after resume | Recovery |
+| --- | --- | --- | --- |
+| 1 | 43.264 seconds, RTC IRQ 109; success 1/fail 0 | +60.288 and +120.270 seconds: fresh matching bearer, both bound ICMP targets and HTTPS 200 passed | Generation 0, unspent |
+| 2 | 5.227 seconds, early modem IRQ 160; cumulative success 2/fail 0 | +60.270 and +120.274 seconds: the same independent checks passed | Generation 0, unspent |
+
+The recorder obtained the actual resume timestamps independently of the
+continuous stream. Neither cycle missed its scheduled data readings. The
+first cached observation was approximately resume +10 seconds for cycle 1
+and +48 seconds for cycle 2; there are no T0 readings. Cycle 1's cached
+availability was false during the initial host awake grace and true by
+approximately +30 seconds. No external live probe was sent while unavailable.
+
+Cycle 1 met the evidence gate for cycle 2. **Cycle 2 is an early-wake result,
+not a second full RTC pass.** No replacement request was made. All four
+services, IMS/SIM, the private number query (status/count only), ownership,
+ACK and lease checks remained healthy after each cycle. Unit logs contain
+only the two ordinary cold-start SETUPs, with **zero recovery SETUPs**.
+The observed sleeps did not reproduce the missing internet bearer. Healthy
+scheduled checks do not prove that every intervening packet would pass,
+and they do not validate a recovery path that was never exercised.
+
+Keep the smoke findings visible. Cycle 2 added two unclassified error-level
+CPIF lines: a wake work item pending during suspend and its replay afterward.
+On the installed kernel these are the `ap_wakeup_handler` deferral and
+`PM_POST_SUSPEND` replay paths in `modem_ctrl_s5100.c`, not failure returns.
+The final cold boot added three optional smoke findings: two IRQ-already-active
+messages from the duplicate-enable guard and a missing SBD-IPC attribute
+message from the startup branch that skips SBD initialization and continues
+IPC setup. Source review identifies their branches; no error filter was
+changed. Required smoke checks passed, with no oops or WARN, but this is
+not a blanket claim of zero new error-level messages.
+
+The mandatory final reboot restored the exact original configuration and
+verified recovery disabled, normal modem sleep-block inhibitor actually
+held, suspend marker absent, automatic sleep off, NFC services and original
+power/polling state restored, watchdog 0 and no pending RTC alarm. Fresh
+data/IMS/SIM, all four units, installed hashes and required smoke passed;
+all six protected radio/calibration checksums remained unchanged.
+
+The bounded sequence is complete. Modem-online sleep remains unqualified
+and blocked. The next recovery qualification needs an actual reproduced
+bearer loss followed by a successful guarded SETUP and independent packet
+proof; these retained-bearer cases cannot substitute for that evidence.
