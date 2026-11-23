@@ -63,6 +63,9 @@
 #     --rootfs FILE          the root image (.img.zst; default: the newest
 #                            image for this device in out/, or the exact
 #                            image named by a signed bundle's MANIFEST)
+#     --prepared-image FILE  repository mode: preserve an independently qualified
+#                            managed root. Requires --serial, --rootfs and --images.
+#                            See docs/PREPARED-IMAGE.md for the private receipt.
 #     --work DIR             where the local image copy goes (default
 #                            ~/.cache/omamobile-install; needs the image's
 #                            size free). The next run that finds no other
@@ -140,11 +143,13 @@ for a in "$@"; do
 done
 
 dry=0 device="" images="" rootfs="" work="" slots_match="" unsigned=0 reinstall=0 verify_only=0 want_serial="" measure_ok=0
+prepared_receipt="" prepared_stage=""
 guided=${OMAMOBILE_INSTALL_GUIDED:-}
 while (($#)); do
   case $1 in
     --dry-run) dry=1 ;;
     --device) device=${2:?}; shift ;;
+    --prepared-image) prepared_receipt=${2:?}; shift ;;
     --images) images=${2:?}; shift ;;
     --rootfs) rootfs=${2:?}; shift ;;
     --work) work=${2:?}; shift ;;
@@ -161,6 +166,9 @@ while (($#)); do
   shift
 done
 
+if [[ -n $prepared_receipt ]]; then
+  [[ -n $want_serial && -n $rootfs && -n $images ]] || die "--prepared-image requires --serial, --rootfs and --images"
+fi
 # --- Where things are: a release bundle, or this repository ------------------
 # In a bundle this file is at its top, as "install", or in its tools/; the
 # bundle is the directory with device.conf and images/.
@@ -168,6 +176,7 @@ if [[ ${here##*/} == tools && -f $here/../device.conf && -d $here/../images ]]; 
   here=$(cd -- "$here/.." && pwd)
 fi
 if [[ -f $here/device.conf && -d $here/images ]]; then
+  [[ -z $prepared_receipt ]] || die "--prepared-image is for repository mode, not signed release bundles"
   mode=bundle
   conf=$here/device.conf
   [[ -z $images || $(readlink -f "$images") == "$here/images" ]] ||
@@ -238,7 +247,7 @@ SLOT_PROBE=${D[BOOTLOADER_SLOT_PROBE]:-no}
 [[ ${D[FASTBOOT_BUTTONS]:-} =~ ^[\ -~]{0,200}$ ]] || die "$conf: FASTBOOT_BUTTONS is one line of at most 200 printable characters"
 # Images record the device they were built for, as flash and push check:
 # out-int/images holds whichever device was built last.
-if [[ $mode == repository ]]; then
+if [[ $mode == repository && ( -z $prepared_receipt || -e $images/DEVICE ) ]]; then
   built_for=$(cat "$images/DEVICE" 2>/dev/null || true)
   [[ $built_for == "$CODENAME" ]] \
     || die "$images holds images for '${built_for:-an unknown device}', not $CODENAME (run: DEVICE=$CODENAME bin/omamobile images)"
@@ -451,6 +460,8 @@ if [[ -n $root_digest ]]; then
   [[ ${rootfs##*/} == "$root_name" ]] || die "root image must be $root_name, as named by the signed bundle"
   [[ $(sha256sum < "$rootfs" | cut -d' ' -f1) == "$root_digest" ]] || die "root image does not match the signed bundle"
   note "root image matches the signed bundle"
+elif [[ -n $prepared_receipt ]]; then
+  note "prepared mode: root and boot digests will be checked against the private receipt"
 elif [[ -f $rootfs.sha256 ]]; then
   (cd "$(dirname "$rootfs")" && sha256sum -c --quiet "$(basename "$rootfs").sha256") || die "$rootfs doesn't match its .sha256"
   note "root image checksum matches"
@@ -482,6 +493,17 @@ fi
 # may be waiting there for its answers, with its images staged.
 work=${work:-${XDG_CACHE_HOME:-$HOME/.cache}/omamobile-install}
 verify_dir=""
+cleanup_prepared() { [[ -z $prepared_stage ]] || rm -rf -- "$prepared_stage"; }
+if [[ -n $prepared_receipt ]]; then
+  mkdir -p -- "$work"; prepared_stage=$(mktemp -d -- "$work/prepared.XXXXXX")
+  trap cleanup_prepared EXIT
+  prepared_helper=$here/lib/prepared_image.py
+  stage_options=()
+  ((verify_only || dry)) || stage_options+=(--writing)
+  python3 -I "$prepared_helper" stage --receipt "$prepared_receipt" --device "$CODENAME" --serial "$want_serial" \
+    --rootfs "$rootfs" --images "$images" --partitions "$BOOT_IMAGES" --directory "$prepared_stage" "${stage_options[@]}"
+  work=$prepared_stage; images=$prepared_stage/images
+fi
 # vendor_ramdisk get IMG OUT, or vendor_ramdisk set IMG RAMDISK OUT (inline,
 # because a bundle ships this script alone)
 vendor_ramdisk() {
@@ -534,7 +556,7 @@ if [[ -n $ramdisk_image ]]; then
   [[ -z ${avb_size[$ramdisk_image]:-} ]] || die "$conf: AVB_FOOTERS names $ramdisk_image, which carries the ramdisk: the owner's key can't be added to a signed image"
   mkdir -p "$work" && verify_dir=$(mktemp -d "$work/verify.XXXXXX") ||
     die "can't create or write to the work directory $work (give one you can write to with --work DIR)"
-  trap 'rm -rf "$verify_dir"' EXIT
+  trap 'rm -rf "$verify_dir"; cleanup_prepared' EXIT
   # A run killed outright leaves its directory behind. Each run holds a shared
   # lock on --work itself (no file of its own there) until it exits, and marks
   # its directory only once it holds that lock; a run that gets it alone
@@ -566,6 +588,10 @@ PY
   # reason, so the message carries only that last line.
   listing=$(cpio -it --quiet < "$verify_dir/shipped.cpio" 2> "$verify_dir/cpio.err") ||
     die "cpio couldn't list $ramdisk_image.img's ramdisk: $(tail -n 1 "$verify_dir/cpio.err")"
+fi
+if [[ -n $prepared_stage ]]; then
+  [[ -n $ramdisk_image ]] || die "prepared installation requires a verifiable recovery ramdisk"
+  python3 -I "$prepared_helper" ramdisk "$verify_dir/shipped.cpio"
 fi
 if ((verify_only)); then
   say "The files check out (the phone was not contacted)"
@@ -656,6 +682,7 @@ slot_probe_lost() {  # SLOT WHEN
 slot_probe_undo() {
   local rc=$? slot=$probe_restore
   trap - EXIT INT TERM HUP
+  if [[ -n $prepared_stage ]]; then trap cleanup_prepared EXIT; fi
   if [[ -n $slot ]]; then
     probe_restore=""
     if ! phone_listed; then
@@ -743,6 +770,7 @@ slot_probe() {
   slot_flags_read after
   probe_restore=""
   trap - EXIT INT TERM HUP
+  if [[ -n $prepared_stage ]]; then trap cleanup_prepared EXIT; fi
   note "the phone is back on slot $x. Slot flags:"
   slot_flags_line before "before"
   slot_flags_line during "on slot $other"
@@ -838,6 +866,12 @@ for p in $BOOT_IMAGES; do
     || die "$conf: AVB_FOOTERS pads $p to ${avb_size[$p]} bytes, but ${p}_b is $psize: its footer would not be at the end of the partition"
 done
 
+if [[ -n $prepared_stage ]]; then
+  userdata_size=$(sed -nE 's/^partition-size:userdata:[ ]*(0x[0-9a-fA-F]{1,12})$/\1/p' <<<"$vars" | head -1)
+  [[ -n $userdata_size ]] || die "prepared installation requires the handset's userdata partition size"
+  (( $(stat -c %s "$prepared_stage/root.img") <= userdata_size )) || die "prepared root exceeds userdata capacity"
+fi
+
 # --- The owner's answers -----------------------------------------------------
 RESERVED='^(root|alarm|omamobile|omandroid|omarchy|bin|daemon|mail|ftp|http|nobody|dbus|systemd-.*|tss|uuidd|alpm|git|avahi|cups|cups-browsed|lp|_talkd|polkitd|rtkit|qemu|brltty|gluster|rpc|libvirt-qemu|pcscd|nvidia-persistenced|sddm|builder|admin)$'
 USERNAME_RE='^[a-z_][a-z0-9_-]{0,31}$'
@@ -846,6 +880,11 @@ SSHKEY_RE='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@op
 ask() { local prompt=$1 default=${2:-} answer; [[ -n $guided ]] || printf '%s%s: ' "$prompt" "${default:+ [$default]}" >&2; IFS= read -r answer || die "no answer"; printf '%s' "${answer:-$default}"; }
 ask_secret() { local answer; [[ -n $guided ]] || printf '%s: ' "$1" >&2; IFS= read -rs answer || die "no answer"; [[ -n $guided ]] || printf '\n' >&2; printf '%s' "$answer"; }
 
+# Stock images run firstboot; preserve the already verified managed root.
+if [[ -n $prepared_stage ]]; then
+  copy=$work/root.img sparse=$work/root.simg
+  keys_file=$work/recovery.pub ramdisk_dir=$work/ramdisk
+else
 say "About the phone's owner"
 while true; do
   username=$(ask "User name")
@@ -970,6 +1009,7 @@ cmp -s <(debugfs -R "cat /root/.ssh/authorized_keys" "$copy" 2>/dev/null) "$keys
 cmp -s <(debugfs -R "cat /etc/omamobile/boot-update.conf" "$copy" 2>/dev/null) "$boot_conf" || die "writing boot-update.conf into the image copy failed"
 e2fsck -fn "$copy" >/dev/null 2>&1 || die "the image copy doesn't check clean after the writes"
 note "firstboot.conf, root's authorized_keys and boot-update.conf (AUTO_WRITE=$BOOT_UPDATE_AUTO_WRITE) written, file system checks clean"
+fi
 userdata_image=$copy
 if command -v img2simg >/dev/null; then
   img2simg "$copy" "$sparse"
@@ -1016,6 +1056,12 @@ if [[ -n $ramdisk_image ]]; then
     isize=$(stat -c %s "$ramdisk_dir/$ramdisk_image.img")
     ((isize <= part_size[$ramdisk_image])) ||
       die "$ramdisk_image.img with the owner's key is $isize bytes, larger than ${ramdisk_image}_b (${part_size[$ramdisk_image]} bytes)"
+    if [[ -n $prepared_stage ]]; then
+      vendor_ramdisk get "$ramdisk_dir/$ramdisk_image.img" "$verify_dir/installed.lz4"
+      lz4 -dc "$verify_dir/installed.lz4" > "$verify_dir/installed.cpio"
+      python3 -I "$prepared_helper" ramdisk "$verify_dir/installed.cpio" --key "$keys_file"
+      note "personalized recovery boot SHA256: $(sha256sum < "$ramdisk_dir/$ramdisk_image.img" | cut -d' ' -f1)"
+    fi
     image_file[$ramdisk_image]=$ramdisk_dir/$ramdisk_image.img
     note "the owner's key appended to $ramdisk_image.img's initramfs (as omamobile-boot-update appends it)"
   fi
@@ -1042,9 +1088,13 @@ run() {
 
 say "The plan"
 note "phone:     ${D[NAME]:-$CODENAME} ($CODENAME), serial $serial"
-note "user:      $username ($credential), host $hostname, time zone $timezone"
-note "Wi-Fi:     ${wifi_ssid:-none}"
-note "SSH key:   ${ssh_key:0:40}... (root and $username)"
+if [[ -n $prepared_stage ]]; then
+  note "prepared managed root: accounts and system configuration preserved"
+else
+  note "user:      $username ($credential), host $hostname, time zone $timezone"
+  note "Wi-Fi:     ${wifi_ssid:-none}"
+  note "SSH key:   ${ssh_key:0:40}... (root and $username)"
+fi
 note "root image: $(basename "$rootfs")"
 echo
 echo "These commands, and only these, will run:"
@@ -1074,6 +1124,8 @@ if ((dry)); then
   else
     say "Dry run done: nothing was written to the phone"
   fi
+elif [[ -n $prepared_stage ]]; then
+  say "Done. The phone boots its prepared managed root on slot B."
 else
   say "Done. The phone boots slot B; the first boot sets up $username (a few minutes)."
   if [[ -z $guided ]]; then
