@@ -516,12 +516,10 @@ class Service:
                 print('Data-call list changed: not described:', type(error).__name__, flush=True)
             # An explicitly requested guarded recovery owns this bearer, including
             # the interval before it is armed and any terminal failure.
-            if self.recovery_requested:
-                if self.recovery is not None:
-                    self.recovery.observe(self.data_call_list)
-                    self.publish()
-                return
-            if internet_dropped(self.data_call_list) and self.internet_setup \
+            if self.recovery is not None:
+                self.recovery.observe(self.data_call_list)
+                self.publish()
+            elif not self.recovery_requested and internet_dropped(self.data_call_list) and self.internet_setup \
                     and self.current_stage == 'running' and not self.reconnecting and self.reconnect_at is None:
                 # The network or the modem ended the internet bearer; nothing
                 # else brings it back (2026-11-15, M6-D: the modem listed CID 3
@@ -609,7 +607,7 @@ class Service:
         doubling to 5 minutes, and every 30 minutes after the twelfth. A try
         holds sitd's loop (up to about two minutes: settle, registration,
         setup), so none starts while a call is live."""
-        if self.recovery_requested:
+        if self.recovery_requested or self.recovery is not None:
             return
         if self.reconnect_at is None or time.monotonic() < self.reconnect_at or not self.internet_setup:
             return
