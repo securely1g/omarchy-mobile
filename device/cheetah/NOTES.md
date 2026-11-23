@@ -2,56 +2,24 @@
 
 Findings from real hardware, newest first. `BRINGUP-M1.md` is the research map written before first boot.
 
-## 2026-11-15: measured sleep checks kept data; recovery was not exercised
+## 2026-11-14: the release kernel for kernel-2026.11.15 boots, with the modem's sleep series
 
-Installed SIT 0.3.37.4 on `7.3.0-rc6-omamobile-gda171eae4cb7` completed an
-approximately 43-second RTC sleep and a second, approximately five-second
-early modem wake. Both had fresh matching bearers, bound ICMP and HTTPS 200
-at the scheduled +60/+120-second checks. No recovery SETUP occurred;
-the second cycle is not a full RTC pass and automatic repair remains
-unproven. Required smoke checks passed; optional CPIF deferred-wake and
-cold-start diagnostic findings remain recorded without changing filters.
-The final clean reboot restored the exact original guarded configuration,
-verified data/IMS/SIM and all six unchanged NV checksums, with recovery and
-automatic sleep off. See [MODEM-PLAN](MODEM-PLAN.md#m6-measured-retest-data-healthy-recovery-unexercised-2026-11-15).
-
-## 2026-11-14: 0.3.37.4 woke on the RTC; early measurements were missed
-
-SIT 0.3.37.4 on `7.3.0-rc6-omamobile-gda171eae4cb7` passed awake host
-acceptance and completed one roughly 44-second RTC-woken sleep. The SSH
-stream's keepalive expired during the freeze, so the planned early data
-checks were missed. A late check at wake +424 seconds passed bound ICMP and
-HTTPS with a matching active internet bearer. No recovery SETUP was sent.
-This does not qualify guarded recovery or uninterrupted data. The final
-guarded reboot restored the original settings and verified data/IMS/SIM,
-smoke and all six NV checksums. See [MODEM-PLAN](MODEM-PLAN.md#m6-03374-rtc-wake-and-late-healthy-data-early-observation-lost-2026-11-14).
-
-## 2026-11-14: guarded recovery stopped before sleep at host address validation
-
-Local SIT 0.3.37.3 on `7.3.0-rc6-omamobile-gda171eae4cb7` reached a healthy
-modem baseline, but the new host address predicate rejected the interface
-before initial ACK 0. The controller spent no recovery attempt and held its
-strong guard; no sleep was requested. A guarded final reboot restored data,
-IMS/SIM and required smoke checks, with all six NV checksums unchanged.
-The recovered interface's kernel-generated IPv6 link-local shape reproduces
-the rejection offline; 0.3.37.4 preserves only that explicitly marked shape.
-The failed boot's address list was not captured. This is an awake validator
-fix, with sleep/recovery qualification still pending; details are in
-[MODEM-PLAN](MODEM-PLAN.md#m6-recovery-03373-stopped-at-awake-host-validation-2026-11-14).
-
-## 2026-11-14: the cellular resume retest lost its owned internet bearer
-
-An additional cheetah tested local SIT 0.3.37.2-1 on
-`7.3.0-rc6-omamobile-gda171eae4cb7`, with powered USB and automatic sleep
-off. Awake data/IMS/SIM and required smoke checks passed. Its first actual
-sleep woke early after about four seconds on `cp2ap_wakeup`. At the first
-check, about 24 seconds after resume, the fresh modem list omitted owned
-internet CID 3; bound ICMP and HTTPS failed while the cellular route was
-still present. The second sleep was skipped. The approved final clean
-reboot with original config and sleep inhibited recovered data, IMS and
-SIM; smoke passed and all six protected radio/calibration checksums were
-unchanged. Modem-online sleep remains unqualified. Details and limits are
-in [MODEM-PLAN](MODEM-PLAN.md#m6-route-recovery-retest-owned-internet-bearer-disappeared-2026-11-14).
+The kernel that will be tagged `kernel-2026.11.15` is linux-omarchy-mobile's
+`omamobile` at `da171eae4cb7`: `kernel-2026.11.13` plus 20 commits, among
+them #232's five `PCI: dwc: gs201-cp` commits (system sleep refused before
+the freeze while the modem's link is up, the modem left out of system sleep,
+resume no longer waiting for its link, the root port kept off the PCI core's
+sleep handling). The rest are zuma device-tree commits for other phones. Its
+release build, `7.3.0-rc6-omamobile-gda171eae4cb7` (a clean checkout of
+`da171eae4cb7`), was pushed to the reference phone with the modem stopped
+first, and booted: `tools/phone-smoke` passed with nothing failed, no UFS
+line, the modem came up registered (IMS voice and SMS) with its data bearer
+up (3 of 3 pings over `rmnet2`), and the touchscreen's `power/wakeup` read
+`enabled`. With the screen off and the modem up, two RTC-armed
+`systemctl suspend` runs behaved as on the test kernel (SUSPEND-PLAN,
+2026-11-14, M6): the first sleep was entered and woke on the modem after
+1.5 s, the second was refused twice before the freeze while the link was
+busy, and data (3 of 3) and storage (no UFS line) were clean after each.
 
 ## 2026-11-13: the release kernel kernel-2026.11.13 boots, power off stays off, double tap wakes from sleep
 
