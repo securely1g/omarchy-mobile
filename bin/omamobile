@@ -850,7 +850,11 @@ cmd_initramfs() {
         "$ROOT/tools/module-load-once.c" -L"$sysroot/usr/lib" -lc "$builtins" "$sysroot/usr/lib/crtn.o"
     fi
     # A/B slot metadata in devinfo (Apache-2.0 port of Google's boot HAL). Not called by init yet.
-    "$CLANG_DIR/bin/clang" --target=aarch64-linux-musl --sysroot="$sysroot" -fuse-ld=lld -static -nostdlib -O2 \
+    local -a bootctl_flags=()
+    if [[ $DEV_PACKAGE == omamobile-device-cheetah ]]; then
+      bootctl_flags+=(-DOMAMOBILE_CHEETAH_DEVINFO_319)
+    fi
+    "$CLANG_DIR/bin/clang" --target=aarch64-linux-musl --sysroot="$sysroot" -fuse-ld=lld -static -nostdlib -O2 "${bootctl_flags[@]}" \
       -o "$stage/usr/local/bin/omamobile-bootctl" "$sysroot/usr/lib/crt1.o" "$sysroot/usr/lib/crti.o" \
       "$ROOT/packages/$DEV_PACKAGE/src/omamobile-bootctl.c" -L"$sysroot/usr/lib" -lc "$builtins" "$sysroot/usr/lib/crtn.o"
   else
