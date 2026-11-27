@@ -433,6 +433,18 @@ class HostTests(unittest.TestCase):
         self.assertEqual(path.read_text(), 'nameserver 198.51.100.53\n')
         self.assertFalse(self.fake.addresses)
 
+    def test_restart_restores_global_dns_from_the_previous_build(self):
+        path = self.prepare_file_dns()
+        journal = protocol.read_host()
+        legacy = '# Omarchy Mobile cellular fallback (session only)\nnameserver 192.0.2.53\n'
+        path.write_text(legacy)
+        protocol.publish_host(dict(journal, dns=dict(journal['dns'], owned=legacy)))
+
+        other = host.ManagedNetwork(protocol.read_state())
+        self.assertFalse(other.start())
+        self.assertEqual(path.read_text(), 'nameserver 198.51.100.53\n')
+        self.assertFalse(self.fake.addresses)
+
     def test_restart_does_not_overwrite_concurrent_wifi_dns(self):
         path = self.prepare_file_dns()
         path.write_text('nameserver 203.0.113.53\n')

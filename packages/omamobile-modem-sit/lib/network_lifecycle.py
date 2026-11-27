@@ -83,6 +83,11 @@ def _addresses(data):
     return str(address), [str(a) for a in servers]
 
 
+def fallback_resolver_text(servers):
+    return '# Omamobile cellular fallback (session only)\n' + ''.join(
+        'nameserver ' + server + '\n' for server in servers)
+
+
 def _validate(value, kind):
     fields = {'version', 'epoch', 'generation', 'cid', 'binding'}
     fields |= ({'response_hex', 'address_state', 'route_state', 'dns'} if kind == 'host'
@@ -107,13 +112,15 @@ def _validate(value, kind):
             valid = set(dns) == {'kind', 'state'} and dns['state'] in ('setting', 'owned', 'releasing')
         else:
             _, servers = _addresses(bytes.fromhex(value['response_hex']))
-            expected = '# Omarchy Mobile cellular fallback (session only)\n' + ''.join('nameserver ' + s + '\n' for s in servers)
+            expected = fallback_resolver_text(servers)
+            # A previous build may have left a journal and resolver file in this boot.
+            legacy = expected.replace('# Omamobile ', '# Omarchy Mobile ', 1)
             valid = (set(dns) == {'kind', 'state', 'path', 'original', 'owned'}
                      and dns['state'] in ('setting', 'owned', 'releasing')
                      and isinstance(dns['path'], str) and dns['path'].startswith('/')
                      and '\0' not in dns['path'] and len(dns['path']) <= 512
                      and isinstance(dns['original'], str) and len(dns['original']) <= 2048
-                     and dns['owned'] == expected)
+                     and dns['owned'] in (expected, legacy))
     elif kind == 'lease':
         valid = (type(value['desired']) is bool and type(value['awake']) is bool
                  and _timestamp(value['updated']))

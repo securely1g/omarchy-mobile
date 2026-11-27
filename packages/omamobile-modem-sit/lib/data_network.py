@@ -173,7 +173,7 @@ class Resolver:
 
     def update(self, cellular, servers):
         if cellular:
-            content = '# Omamobile cellular fallback (session only)\n' + ''.join('nameserver ' + s + '\n' for s in servers)
+            content = lifecycle.fallback_resolver_text(servers)
             current = self.path.read_text()
             if self.owned is None or current != self.owned:
                 self.original = current
@@ -596,8 +596,7 @@ class ManagedNetwork:
             current = self.resolver.path.read_text()
             original = (current if self.resolver.owned is None or current != self.resolver.owned
                         else self.resolver.original)
-            content = '# Omarchy Mobile cellular fallback (session only)\n' + ''.join(
-                'nameserver ' + server + '\n' for server in self.dns)
+            content = lifecycle.fallback_resolver_text(self.dns)
             saved = dict(kind='file', state='setting', path=str(self.resolver.path),
                          original=original, owned=content)
             if self.owned['dns'] != dict(saved, state='owned'):
